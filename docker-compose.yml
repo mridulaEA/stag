@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  stag:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - STREAM_SOURCE=simulator
+      - SIMULATOR_INTERVAL=3.0
+      - LLM_PROVIDER=openai
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - CHROMA_PERSIST_DIR=/app/data/chroma
+      - GRAPH_PERSIST_PATH=/app/data/graph.json
+    volumes:
+      - stag-data:/app/data
+    restart: unless-stopped
+
+  # Optional: Kafka for production streaming
+  # zookeeper:
+  #   image: confluentinc/cp-zookeeper:7.5.0
+  #   environment:
+  #     ZOOKEEPER_CLIENT_PORT: 2181
+  #
+  # kafka:
+  #   image: confluentinc/cp-kafka:7.5.0
+  #   depends_on:
+  #     - zookeeper
+  #   ports:
+  #     - "9092:9092"
+  #   environment:
+  #     KAFKA_BROKER_ID: 1
+  #     KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+  #     KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+  #     KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+volumes:
+  stag-data:

@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stag"
+version = "0.1.0"
+description = "STAG — Stream-Triggered Augmented Generation. Proactive AI that monitors data streams, detects events, and generates insights autonomously."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Enterprise AI Tech"}
+]
+keywords = ["rag", "streaming", "knowledge-graph", "vector-search", "llm", "real-time", "augmented-generation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "chromadb>=0.4.22",
+    "networkx>=3.2",
+    "rank-bm25>=0.2.2",
+    "sentence-transformers>=2.3.0",
+    "openai>=1.10.0",
+    "anthropic>=0.18.0",
+    "aiokafka>=0.10.0",
+    "numpy>=1.26.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.26.0",
+    "structlog>=24.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.2.0",
+]
+
+[project.scripts]
+stag = "stag.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["stag*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
