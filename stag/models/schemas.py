@@ -127,3 +127,6 @@ class PipelineOutput(BaseModel):
     retrieval: RetrievalResult
     insight: GeneratedInsight
     pipeline_time_ms: float = 0.0
+    incident_id: str | None = None
+    investigation_request_id: str | None = None
+    material_change: str | None = None

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions & ideas (Discussions)
+    url: https://github.com/mridulaEA/stag/discussions
+    about: Ask how to use STAG, share a TechOps workflow, or propose a direction before opening an issue.
+  - name: Skill catalog
+    url: https://github.com/mridulaEA/stag/tree/main/skills
+    about: Browse the existing skills before proposing a new one.

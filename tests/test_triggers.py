@@ -1,17 +1,15 @@
 """Tests for trigger rules and engine."""
 
-import pytest
 from stag.models import StreamEvent
 from stag.models.schemas import EventType, Severity
-from stag.triggers.rules import (
-    SeverityThresholdRule,
-    SensitiveDataRule,
-    PatternMatchRule,
-    DataVolumeRule,
-    FrequencyRule,
-    RuleRegistry,
-)
 from stag.triggers.engine import TriggerEngine
+from stag.triggers.rules import (
+    DataVolumeRule,
+    PatternMatchRule,
+    RuleRegistry,
+    SensitiveDataRule,
+    SeverityThresholdRule,
+)
 
 
 def _make_event(**kwargs) -> StreamEvent:

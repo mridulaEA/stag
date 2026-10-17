@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: Core tests, lint, skills
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install core dependencies (no ML downloads)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pydantic pydantic-settings structlog pyyaml fastapi httpx pytest pytest-asyncio ruff
+      - name: Lint
+        run: ruff check stag tests
+      - name: Validate skill pack
+        run: python -m stag.skills validate
+      - name: Test TechOps backbone, triggers, skills tooling, API
+        run: python -m pytest tests/test_techops.py tests/test_triggers.py tests/test_skills.py tests/test_techops_api.py -q
+
+  full:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    needs: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install all dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run all tests
+        run: python -m pytest tests -q
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend

@@ -1,0 +1,18 @@
+{
+  "name": "stag-techops",
+  "displayName": "STAG TechOps Skills",
+  "version": "0.2.0",
+  "description": "TechOps workflows for Stream-Triggered Augmented Generation: incident triage, dedup/correlation, bounded investigation, retry-safe remediation, recovery verification, postmortems, resilience tests, enterprise onboarding, plus multi-agent roles and STAG development skills.",
+  "author": { "name": "Enterprise AI Tech", "url": "https://enterpriseaitech.com" },
+  "homepage": "https://github.com/mridulaEA/stag",
+  "repository": "https://github.com/mridulaEA/stag",
+  "license": "MIT",
+  "keywords": ["stag", "techops", "incident-response", "rag", "streaming", "multi-agent", "sre"],
+  "skills": ["./skills/"],
+  "agents": [
+    "./agents/stag-incident-coordinator.md",
+    "./agents/stag-investigator.md",
+    "./agents/stag-remediation-reviewer.md",
+    "./agents/stag-recovery-verifier.md"
+  ]
+}

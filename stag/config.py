@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Literal
 
 from pydantic_settings import BaseSettings
@@ -44,6 +43,13 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     cors_origins: str = '["http://localhost:5173","http://localhost:3000"]'
+
+    # TechOps coordinator (deterministic backbone)
+    techops_coordinator_enabled: bool = False
+    techops_tenant: str = "default"
+    techops_investigation_cooldown_seconds: int = 300
+    techops_recurrence_window_seconds: int = 3600
+    techops_dedup_retention: int = 50000
 
     # Simulator
     simulator_interval: float = 3.0

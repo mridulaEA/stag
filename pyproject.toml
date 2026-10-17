@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stag"
-version = "0.1.0"
+version = "0.2.0"
 description = "STAG — Stream-Triggered Augmented Generation. Proactive AI that monitors data streams, detects events, and generates insights autonomously."
 readme = "README.md"
 license = {text = "MIT"}
@@ -39,6 +39,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "httpx>=0.26.0",
     "structlog>=24.1.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -51,13 +52,24 @@ dev = [
 
 [project.scripts]
 stag = "stag.main:cli"
+stag-skills = "stag.skills.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["stag*"]
 
+[tool.setuptools.package-data]
+stag = ["py.typed"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "UP042"]  # E501: long prompt/table lines; UP042: `str, Enum` kept for pydantic JSON on 3.11
+
+[tool.ruff.lint.isort]
+known-first-party = ["stag"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

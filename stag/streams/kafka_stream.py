@@ -45,8 +45,10 @@ class KafkaStreamSource(StreamSource):
                 servers=self.bootstrap_servers,
                 topic=self.topic,
             )
-        except ImportError:
-            raise RuntimeError("aiokafka is required for Kafka streaming. Install with: pip install aiokafka")
+        except ImportError as e:
+            raise RuntimeError(
+                "aiokafka is required for Kafka streaming. Install with: pip install aiokafka"
+            ) from e
 
     async def disconnect(self) -> None:
         if self._consumer:

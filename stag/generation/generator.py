@@ -11,8 +11,12 @@ import json
 import structlog
 
 from stag.config import Settings
-from stag.generation.prompts import SYSTEM_PROMPT, INSIGHT_PROMPT_TEMPLATE, FALLBACK_INSIGHT_TEMPLATE
-from stag.models import StreamEvent, TriggerResult, RetrievalResult, GeneratedInsight
+from stag.generation.prompts import (
+    FALLBACK_INSIGHT_TEMPLATE,
+    INSIGHT_PROMPT_TEMPLATE,
+    SYSTEM_PROMPT,
+)
+from stag.models import GeneratedInsight, RetrievalResult, StreamEvent, TriggerResult
 from stag.models.schemas import Severity
 
 logger = structlog.get_logger()

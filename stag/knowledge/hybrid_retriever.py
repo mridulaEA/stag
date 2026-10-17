@@ -10,10 +10,10 @@ import time
 
 import structlog
 
-from stag.knowledge.vector_store import VectorStore
 from stag.knowledge.graph_store import GraphStore
 from stag.knowledge.sparse_store import SparseStore
-from stag.models import StreamEvent, RetrievalResult
+from stag.knowledge.vector_store import VectorStore
+from stag.models import RetrievalResult, StreamEvent
 
 logger = structlog.get_logger()
 

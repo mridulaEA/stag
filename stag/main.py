@@ -6,26 +6,25 @@ and starts the stream processing loop.
 
 from __future__ import annotations
 
-import asyncio
-import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import structlog
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 
 from stag.api.routes import router, set_dependencies
 from stag.api.websocket import ConnectionManager
 from stag.config import get_settings
 from stag.generation import InsightGenerator
-from stag.knowledge import VectorStore, GraphStore, SparseStore, HybridRetriever
+from stag.knowledge import GraphStore, HybridRetriever, SparseStore, VectorStore
 from stag.pipeline import PipelineOrchestrator
-from stag.streams.simulator import EventSimulator
 from stag.streams.kafka_stream import KafkaStreamSource
+from stag.streams.simulator import EventSimulator
 from stag.streams.webhook import WebhookStreamSource
+from stag.techops import ActionLedger, IncidentCoordinator
 from stag.triggers import TriggerEngine
 
 structlog.configure(
@@ -79,19 +78,30 @@ async def lifespan(app: FastAPI):
     retriever = HybridRetriever(vector_store, graph_store, sparse_store)
     generator = InsightGenerator(settings)
 
+    coordinator = None
+    if settings.techops_coordinator_enabled:
+        coordinator = IncidentCoordinator(
+            tenant=settings.techops_tenant,
+            investigation_cooldown_seconds=settings.techops_investigation_cooldown_seconds,
+            recurrence_window_seconds=settings.techops_recurrence_window_seconds,
+            dedup_retention=settings.techops_dedup_retention,
+        )
+        logger.info("techops.coordinator_enabled", tenant=settings.techops_tenant)
+
     pipeline = PipelineOrchestrator(
         stream_source=stream,
         trigger_engine=trigger_engine,
         retriever=retriever,
         generator=generator,
         settings=settings,
+        coordinator=coordinator,
     )
 
     # Register WebSocket broadcast as pipeline callback
     pipeline.on_output(ws_manager.broadcast)
 
     # Wire up API routes
-    set_dependencies(pipeline, ws_manager)
+    set_dependencies(pipeline, ws_manager, action_ledger=ActionLedger())
 
     # Initialize and start
     await pipeline.initialize()
@@ -110,7 +120,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="STAG",
         description="Stream-Triggered Augmented Generation — Proactive AI for enterprise data streams",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
 
@@ -142,7 +152,7 @@ def cli():
     settings = get_settings()
     print(f"""
 ╔══════════════════════════════════════════════════╗
-║              STAG v0.1.0                         ║
+║              STAG v0.2.0                         ║
 ║  Stream-Triggered Augmented Generation           ║
 ║                                                  ║
 ║  Stream:  {settings.stream_source:<20s}             ║

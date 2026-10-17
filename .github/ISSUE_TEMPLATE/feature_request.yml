@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose an enhancement to STAG
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, and what operational scenario motivates it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: Touches the deterministic backbone (`stag/techops/`) — I will add resilience-test rows
+        - label: Adds configuration — I will update `.env.example` and README
+        - label: I am willing to implement this

@@ -1,0 +1,48 @@
+name: Skill proposal
+description: Propose a new skill for the STAG skill pack (Claude Code / Codex / Cursor)
+labels: [skill, community]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Proposed skill name
+      description: Lowercase, hyphenated, prefixed `stag-` (TechOps workflows `stag-techops-<workflow>`).
+      placeholder: stag-techops-change-freeze-review
+    validations:
+      required: true
+  - type: dropdown
+    id: domain
+    attributes:
+      label: Domain
+      options: [techops, development, community]
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description (as agents will see it)
+      description: What it does, when to use it, when NOT to use it (name the sibling skill). ≤ 1024 chars.
+    validations:
+      required: true
+  - type: textarea
+    id: procedure
+    attributes:
+      label: Procedure outline
+      description: Numbered steps with the STAG objects/APIs each one touches.
+  - type: textarea
+    id: output
+    attributes:
+      label: Output the skill produces
+  - type: textarea
+    id: guardrails
+    attributes:
+      label: Guardrails
+      description: What the skill must never do (state change by claim, new op id for retry, mutations without the ledger, ...).
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked `skills/README.md` and this does not duplicate an existing skill
+        - label: I read `skills/stag-skill-authoring/SKILL.md`
+        - label: I can test it in at least one runtime (Claude Code, Codex or Cursor)

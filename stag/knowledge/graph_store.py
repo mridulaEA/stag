@@ -14,7 +14,7 @@ from pathlib import Path
 import networkx as nx
 import structlog
 
-from stag.models import StreamEvent, GraphNode, GraphEdge
+from stag.models import StreamEvent
 
 logger = structlog.get_logger()
 
