@@ -1,14 +1,23 @@
 {
   "name": "stag-skills",
-  "description": "Skills and agents for STAG (Stream-Triggered Augmented Generation) — TechOps incident workflows, multi-agent roles and STAG development helpers.",
-  "owner": { "name": "Enterprise AI Tech", "url": "https://enterpriseaitech.com" },
+  "description": "Skills and agents for STAG (Stream-Triggered Augmented Generation) \u2014 TechOps incident workflows, multi-agent roles and STAG development helpers.",
+  "owner": {
+    "name": "Enterprise AI Tech",
+    "url": "https://enterpriseaitech.com"
+  },
   "plugins": [
     {
       "name": "stag-techops",
       "source": ".",
-      "description": "STAG TechOps skill pack: triage, dedup/correlation, bounded investigation, remediation ledger, recovery verification, postmortem, resilience tests, enterprise onboarding, signal tuning, multi-agent orchestration, and development skills.",
+      "description": "STAG TechOps skill pack: triage, dedup/correlation, bounded investigation, remediation ledger, recovery verification, postmortem, resilience tests, enterprise onboarding, signal tuning, multi-agent orchestration, and development skills. Includes eight crews: declarative role + workflow compositions runnable end-to-end.",
       "category": "operations",
-      "tags": ["techops", "sre", "incident-response", "multi-agent", "rag"]
+      "tags": [
+        "techops",
+        "sre",
+        "incident-response",
+        "multi-agent",
+        "rag"
+      ]
     }
   ]
 }

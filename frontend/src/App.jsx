@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 import {
   Activity, Zap, Database, Brain, Radio, AlertTriangle,
   Shield, ArrowRight, ChevronDown, ChevronUp, Search,
-  Circle, Layers, GitBranch, BarChart3
+  Circle, Layers, GitBranch, BarChart3, Users, Play, UserCheck
 } from 'lucide-react'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts'
 import useWebSocket from './hooks/useWebSocket'
@@ -136,6 +136,109 @@ function PipelineFlow({ stats }) {
   )
 }
 
+const STEP_COLORS = {
+  coordinate: 'text-blue-400', transition: 'text-gray-400', investigate: 'text-purple-400',
+  propose_action: 'text-yellow-400', authorize: 'text-orange-400', dispatch: 'text-red-400',
+  verify: 'text-green-400', notify: 'text-cyan-400', record: 'text-gray-300',
+}
+
+function CrewCard({ crew }) {
+  const [expanded, setExpanded] = useState(false)
+  const [run, setRun] = useState(null)
+  const [running, setRunning] = useState(false)
+
+  const runCrew = async (autoApprove) => {
+    setRunning(true)
+    try {
+      const res = await fetch(`/api/crews/${crew.name}/run`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ auto_approve: autoApprove }),
+      })
+      if (res.ok) setRun(await res.json())
+    } catch {}
+    setRunning(false)
+  }
+
+  const humans = crew.roles.filter(r => r.human)
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
+      <div className="flex items-start justify-between cursor-pointer" onClick={() => setExpanded(!expanded)}>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="px-2 py-0.5 rounded text-xs border bg-stag-500/10 text-stag-400 border-stag-500/30">{crew.domain}</span>
+            <span className="text-xs text-gray-500">{crew.roles.length} roles · {crew.workflow.length} steps · gate: {humans.map(h => h.title).join(', ')}</span>
+          </div>
+          <h3 className="font-medium text-sm">{crew.display_name}</h3>
+          <p className="text-xs text-gray-400 mt-1 line-clamp-2">{crew.purpose}</p>
+        </div>
+        <div className="ml-2 text-gray-500">{expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}</div>
+      </div>
+
+      {expanded && (
+        <div className="mt-3 pt-3 border-t border-gray-800 space-y-3">
+          <div>
+            <h4 className="text-xs text-gray-500 uppercase mb-1">Roles</h4>
+            <div className="flex flex-wrap gap-2">
+              {crew.roles.map(r => (
+                <span key={r.id} className={`px-2 py-1 rounded text-xs border ${r.human ? 'bg-orange-500/10 text-orange-300 border-orange-500/30' : 'bg-gray-800 text-gray-300 border-gray-700'}`}>
+                  {r.human ? <UserCheck size={11} className="inline mr-1" /> : null}{r.title}{r.agent ? ` · ${r.agent}` : ''}
+                </span>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h4 className="text-xs text-gray-500 uppercase mb-1">Workflow</h4>
+            <div className="flex flex-wrap items-center gap-1 text-xs">
+              {crew.workflow.map((s, i) => (
+                <React.Fragment key={s.step}>
+                  <span className={`font-mono ${STEP_COLORS[s.action] || 'text-gray-300'}`} title={`${s.action}${s.plan_step ? ' · ' + s.plan_step : ''}${s.policy ? ' · ' + s.policy.mode : ''}`}>{s.step}</span>
+                  {i < crew.workflow.length - 1 && <ArrowRight size={10} className="text-gray-700" />}
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h4 className="text-xs text-gray-500 uppercase mb-1">Skills</h4>
+            <p className="text-xs text-gray-400 font-mono">{crew.skills.join(' · ')}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={() => runCrew(false)} disabled={running} className="flex items-center gap-1 px-3 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-xs border border-gray-700">
+              <Play size={12} /> Dry run (halts at human gate)
+            </button>
+            <button onClick={() => runCrew(true)} disabled={running} className="flex items-center gap-1 px-3 py-1.5 rounded bg-stag-600 hover:bg-stag-500 text-xs">
+              <UserCheck size={12} /> Dry run with approvals
+            </button>
+          </div>
+          {run && (
+            <div className="bg-gray-950 border border-gray-800 rounded p-3 text-xs space-y-1">
+              <div className="flex flex-wrap gap-4 text-gray-300">
+                <span>events {run.events_ingested}</span>
+                <span>triggers {run.triggers_fired}</span>
+                <span>duplicates {run.duplicate_deliveries}</span>
+                <span>evidence-only {run.evidence_only_updates}</span>
+                <span className="text-stag-400">model calls avoided {run.model_calls_avoided}</span>
+                <span className="text-green-400">resolved {run.resolved}</span>
+                <span className="text-orange-400">held {run.held}</span>
+              </div>
+              {run.incidents.map(inc => (
+                <div key={inc.incident_id} className="mt-2">
+                  <div className="text-gray-400">{inc.incident_id} · {inc.signal_key} · <span className={inc.final_state === 'resolved' ? 'text-green-400' : 'text-orange-400'}>{inc.final_state}</span></div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {inc.steps.map((s, i) => (
+                      <span key={i} className={`px-1.5 py-0.5 rounded border ${s.status === 'done' ? 'border-gray-700 text-gray-300' : s.status === 'held' || s.status === 'awaiting' ? 'border-orange-500/40 text-orange-300' : 'border-gray-800 text-gray-500'}`} title={s.detail?.reason || s.action}>{s.step}</span>
+                    ))}
+                  </div>
+                  {inc.halted_at && <div className="text-orange-400 mt-1">⏸ {inc.halt_reason}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function App() {
   const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:8000/api/ws`
   const { connected, events, insights } = useWebSocket(wsUrl)
@@ -143,6 +246,12 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState(null)
   const [activeTab, setActiveTab] = useState('insights')
+  const [crews, setCrews] = useState([])
+
+  // Load crews catalog once
+  useEffect(() => {
+    fetch('/api/crews').then(r => r.ok ? r.json() : { crews: [] }).then(d => setCrews(d.crews || [])).catch(() => {})
+  }, [])
 
   // Poll stats
   useEffect(() => {
@@ -338,9 +447,35 @@ export default function App() {
                 Event Stream ({events.length})
               </div>
             </button>
+            <button
+              onClick={() => setActiveTab('crews')}
+              className={`pb-2 text-sm font-medium border-b-2 transition-colors ${
+                activeTab === 'crews' ? 'border-stag-500 text-stag-400' : 'border-transparent text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <Users size={14} />
+                Crews ({crews.length})
+              </div>
+            </button>
           </div>
 
-          {activeTab === 'insights' ? (
+          {activeTab === 'crews' ? (
+            <div className="space-y-3">
+              <p className="text-xs text-gray-500">
+                Ready-made teams (roles + skills + workflow) that run on the TechOps backbone. Dry runs use the bundled
+                scenario on an isolated coordinator and ledger; they never touch live pipeline state.
+              </p>
+              {crews.length === 0 ? (
+                <div className="text-center py-12 text-gray-600">
+                  <Users size={32} className="mx-auto mb-2 opacity-50" />
+                  <p>No crews found. Add one under <span className="font-mono">crews/&lt;name&gt;/crew.yaml</span>.</p>
+                </div>
+              ) : (
+                crews.map(crew => <CrewCard key={crew.name} crew={crew} />)
+              )}
+            </div>
+          ) : activeTab === 'insights' ? (
             <div className="space-y-3">
               {insights.length === 0 ? (
                 <div className="text-center py-12 text-gray-600">

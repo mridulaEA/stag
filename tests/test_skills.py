@@ -31,18 +31,26 @@ def test_techops_and_multi_agent_skills_present():
 
 
 def test_descriptions_say_when_to_use():
+    import re
+
     for skill in discover_skills(SKILLS_DIR):
-        assert "Use when" in skill.description or "Use after" in skill.description, skill.name
+        assert re.search(r"\bUse (when|for|after)\b", skill.description), skill.name
 
 
 def test_agents_match_orchestration_roles():
     agents = {p.stem for p in (SKILLS_DIR.parent / "agents").glob("*.md")}
-    assert agents == {
+    assert agents >= {
         "stag-incident-coordinator",
         "stag-investigator",
         "stag-remediation-reviewer",
         "stag-recovery-verifier",
     }
+    # every agent referenced by a crew exists, and every agent is referenced by some crew or the orchestration skill
+    from stag.crews import CREWS_DIR, discover_crews
+
+    referenced = {a for c in discover_crews(CREWS_DIR) for a in c.agents}
+    assert referenced <= agents, referenced - agents
+    assert agents <= referenced | {"stag-incident-coordinator", "stag-investigator", "stag-remediation-reviewer", "stag-recovery-verifier"}
     for p in (SKILLS_DIR.parent / "agents").glob("*.md"):
         text = p.read_text()
         assert text.startswith("---") and "name: " in text and "description: " in text

@@ -1,0 +1,113 @@
+name: ai-automation
+display_name: AI Automation Governance Crew
+domain: techops
+version: 1.0.0
+purpose: >
+  Watch the automations themselves — runbook bots, agents, scheduled remediations — for failure
+  spikes, retry storms and unknown outcomes; pause a misbehaving automation safely, investigate with
+  bounded evidence, and record candidates and guardrail changes for review. Deterministic first:
+  automation that is wrong consistently is still wrong.
+when_to_use: >
+  You run AI-assisted or scripted automations in production and need STAG to govern them the same
+  way it governs incidents: counted, bounded, approved, verified.
+
+stream:
+  sources: [automation-platform, agent-gateway, temporal]
+  event_types: [automation_run, alert]
+  notes: "payload.automation_id, payload.outcome (ok|failed|unknown), payload.failure_rate, payload.cost_usd"
+
+signal_key:
+  service: payload.automation_id
+  environment: metadata.environment
+
+triggers:
+  - type: numeric_threshold
+    name: automation_failure_spike
+    params: { field: failure_rate, threshold: 0.2, op: gt }
+  - type: pattern
+    name: automation_outcome_unknown
+    params: { field: outcome, pattern: "^unknown$" }
+  - type: frequency
+    name: automation_retry_storm
+    params: { window_seconds: 3600, max_events: 5, group_by: automation_id }
+  - type: numeric_threshold
+    name: automation_cost_runaway
+    params: { field: cost_usd, threshold: 50, op: gt }
+
+coordinator:
+  investigation_cooldown_seconds: 1800
+
+roles:
+  - id: automation_engineer
+    title: Automation engineer
+    agent: stag-automation-engineer
+    skills: [stag-ai-automation-governance, stag-techops-dedup-correlation]
+  - id: investigator
+    title: Bounded investigator
+    agent: stag-investigator
+    skills: [stag-techops-bounded-investigation]
+    permissions:
+      capabilities: [read_metrics, read_incident_history, read_dependency_graph, query_scoped_logs]
+  - id: platform_owner
+    title: Automation platform owner (human)
+    human: true
+    skills: [stag-ai-automation-governance]
+  - id: verifier
+    title: Verifier
+    agent: stag-recovery-verifier
+    skills: [stag-techops-recovery-verification]
+
+workflow:
+  - step: coordinate
+    action: coordinate
+    role: automation_engineer
+  - step: triage
+    action: transition
+    to: triaged
+    role: automation_engineer
+  - step: investigate
+    action: investigate
+    role: investigator
+    assignment: { max_model_calls: 3, max_tool_calls: 6, max_runtime_seconds: 90 }
+  - step: propose_pause
+    action: propose_action
+    role: automation_engineer
+    plan_step: pause_automation
+    target_from: payload.automation_id
+    parameters: { mode: safe_stop, drain_in_flight: true }
+    policy_version: automation-policy@v2
+    preconditions: [no_in_flight_mutations_lost, owner_notified]
+  - step: authorize
+    action: authorize
+    role: platform_owner
+    policy: { mode: policy, auto_if_severity_at_most: medium, approver_role: platform_owner }
+  - step: dispatch
+    action: dispatch
+    role: automation_engineer
+  - step: verify
+    action: verify
+    role: verifier
+  - step: resolve
+    action: transition
+    to: resolved
+    role: automation_engineer
+  - step: review
+    action: record
+    artifact: automation_review
+    role: automation_engineer
+    description: Candidate fixes, guardrail changes, budget adjustments — all pending review.
+  - step: notify_owner
+    action: notify
+    channel: automation-owners
+    template: automation_paused
+    role: automation_engineer
+
+outputs: [Paused automations with recorded approvals, Automation review drafts, Cost and failure evidence per automation]
+kpis:
+  - { name: unknown_outcomes_reconciled, target: "100%" }
+  - { name: cost_per_correct_completed_outcome }
+  - { name: automations_paused_vs_reviewed }
+guardrails:
+  - An automation never pauses or re-enables itself; the ledger holds the operation.
+  - Budget exhaustion degrades to deterministic diagnostics, never to more model calls.
+  - Review drafts do not change policy until a human promotes them.

@@ -1,0 +1,116 @@
+name: data-ops
+display_name: DataOps Reliability Crew
+domain: data
+version: 1.0.0
+purpose: >
+  Watch pipeline runs, data-quality checks and freshness SLAs; correlate failures and drift per
+  dataset; investigate lineage and recent changes within bounds; propose an idempotent backfill or
+  quarantine as one approved operation; verify freshness and quality after the fix; and notify
+  downstream consumers once.
+when_to_use: >
+  Orchestrator events (Airflow, Dagster, dbt), data-quality results (Great Expectations, Soda) and
+  freshness metrics flow into STAG and data owners want fewer, better-handled data incidents.
+
+stream:
+  sources: [airflow, dagster, dbt, great-expectations, freshness-monitor]
+  event_types: [pipeline_run, data_quality, metric]
+  notes: "metadata.dataset is the service key; payload.status, payload.null_ratio, payload.freshness_lag_minutes, payload.partition"
+
+signal_key:
+  service: metadata.dataset
+  environment: metadata.environment
+  symptom_from_rule: false          # one episode per dataset; a new failing rule is a new signature
+  failure_domain_from_event_type: false
+
+triggers:
+  - type: pattern
+    name: pipeline_failed
+    params: { field: status, pattern: "^(failed|error|upstream_failed)$" }
+  - type: numeric_threshold
+    name: data_quality_drift
+    params: { field: null_ratio, threshold: 0.05, op: gt }
+  - type: numeric_threshold
+    name: freshness_sla_breach
+    params: { field: freshness_lag_minutes, threshold: 60, op: gt }
+  - type: numeric_threshold
+    name: row_count_collapse
+    params: { field: row_count_delta_pct, threshold: -40, op: lt }
+
+coordinator:
+  investigation_cooldown_seconds: 1800
+
+roles:
+  - id: data_steward
+    title: Data steward
+    agent: stag-data-steward
+    skills: [stag-dataops-pipeline-triage, stag-techops-dedup-correlation]
+  - id: investigator
+    title: Lineage investigator
+    agent: stag-investigator
+    skills: [stag-techops-bounded-investigation]
+    permissions:
+      capabilities: [read_dependency_graph, inspect_deployment_metadata, read_metrics, read_incident_history, query_scoped_logs]
+  - id: data_owner
+    title: Dataset owner (human)
+    human: true
+    skills: [stag-dataops-pipeline-triage]
+  - id: verifier
+    title: Freshness/quality verifier
+    agent: stag-recovery-verifier
+    skills: [stag-techops-recovery-verification]
+
+workflow:
+  - step: coordinate
+    action: coordinate
+    role: data_steward
+  - step: triage
+    action: transition
+    to: triaged
+    role: data_steward
+    description: One episode per dataset; mark affected partitions and downstream consumers.
+  - step: lineage_investigation
+    action: investigate
+    role: investigator
+    assignment: { max_model_calls: 4, max_tool_calls: 10, max_runtime_seconds: 120, budget_profile: dataops }
+  - step: propose_backfill
+    action: propose_action
+    role: data_steward
+    plan_step: backfill_partition
+    target_from: metadata.dataset
+    parameters: { mode: idempotent_upsert, quarantine_bad_rows: true }
+    policy_version: data-policy@v2
+    preconditions: [upstream_healthy, partition_identified, idempotent_write_path]
+  - step: authorize
+    action: authorize
+    role: data_owner
+    policy: { mode: human, approver_role: data_owner }
+  - step: dispatch
+    action: dispatch
+    role: data_steward
+  - step: verify
+    action: verify
+    role: verifier
+    description: Freshness within SLA and quality checks green on the backfilled partition.
+  - step: resolve
+    action: transition
+    to: resolved
+    role: data_steward
+  - step: notify_consumers
+    action: notify
+    channel: data-consumers
+    template: dataset_restored
+    role: data_steward
+  - step: data_incident_review
+    action: record
+    artifact: data_incident_review
+    role: data_steward
+
+outputs: [Data incident episodes per dataset, Backfill/quarantine operations with approvals, Consumer notifications with provenance, Review drafts]
+kpis:
+  - { name: freshness_sla_restoration_time }
+  - { name: duplicate_backfills, target: "0" }
+  - { name: consumers_notified_once_per_episode }
+guardrails:
+  - Backfills are idempotent upserts with a durable operation id; never re-run blindly.
+  - Quality drift is evidence, not proof of a broken pipeline; check upstream first.
+  - Sensitive columns stay out of evidence packages; cite partitions and metrics.

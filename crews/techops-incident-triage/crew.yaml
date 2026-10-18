@@ -1,0 +1,160 @@
+name: techops-incident-triage
+display_name: TechOps Incident Triage Crew
+domain: techops
+version: 1.0.0
+purpose: >
+  Turn a stream of service alerts, error-rate and latency signals into correctly counted incident
+  episodes, page the owner without waiting for AI, investigate within a bounded assignment, propose
+  one retry-safe mitigation for human approval, verify recovery independently and leave a reviewed
+  postmortem draft.
+when_to_use: >
+  Production services with telemetry (metrics, alerts, structured logs) flowing into STAG where the
+  team wants proactive, deduplicated incident response with humans holding the commit permission.
+
+stream:
+  sources: [alertmanager, datadog, otel-collector, synthetic-monitoring]
+  event_types: [alert, metric, log]
+  notes: "metadata.service and metadata.environment must be set by the adapter (see stag-stream-adapter)"
+
+signal_key:
+  service: metadata.service
+  environment: metadata.environment
+  symptom_from_rule: true
+
+triggers:
+  - type: numeric_threshold
+    name: error_rate_high
+    params: { field: error_rate, threshold: 0.01, op: gt }
+  - type: numeric_threshold
+    name: latency_degraded
+    params: { field: latency_p99_ms, threshold: 1000, op: gt }
+  - type: pattern
+    name: error_signature
+    params: { field: message, pattern: "timeout|connection refused|OutOfMemory|pool exhausted" }
+  - type: severity_threshold
+    name: high_severity_alert
+    params: { min_severity: high }
+
+coordinator:
+  investigation_cooldown_seconds: 900
+  recurrence_window_seconds: 3600
+
+roles:
+  - id: coordinator
+    title: Incident coordinator (deterministic first)
+    agent: stag-incident-coordinator
+    skills: [stag-techops-dedup-correlation, stag-techops-incident-triage, stag-techops-signal-tuning]
+    description: Owns identity, correlation, lifecycle transitions and paging.
+  - id: investigator
+    title: Bounded investigator
+    agent: stag-investigator
+    skills: [stag-techops-bounded-investigation]
+    permissions:
+      capabilities: [query_scoped_logs, read_service_health, read_metrics, read_traces, inspect_deployment_metadata, retrieve_approved_runbooks]
+      production_mutations: false
+  - id: remediation_reviewer
+    title: Remediation reviewer
+    agent: stag-remediation-reviewer
+    skills: [stag-techops-remediation-ledger]
+  - id: recovery_verifier
+    title: Recovery verifier (independent)
+    agent: stag-recovery-verifier
+    skills: [stag-techops-recovery-verification]
+  - id: on_call
+    title: On-call engineer (human approver)
+    human: true
+    skills: [stag-techops-remediation-ledger]
+    description: Holds the commit permission; approves exactly one plan step at a known incident version.
+
+workflow:
+  - step: coordinate
+    action: coordinate
+    role: coordinator
+    description: Dedup redeliveries, attach repeated symptoms, open episodes, request investigation on material change.
+  - step: triage
+    action: transition
+    to: triaged
+    role: coordinator
+    description: Impact assessed separately from log severity; ownership resolved from the catalog.
+  - step: page
+    action: notify
+    channel: pagerduty
+    template: page_owner
+    role: coordinator
+    description: Established detector pages the owning team; independent of AI availability.
+  - step: investigate
+    action: investigate
+    role: investigator
+    assignment: { max_model_calls: 4, max_tool_calls: 8, max_runtime_seconds: 120 }
+  - step: propose_restart
+    action: propose_action
+    role: remediation_reviewer
+    plan_step: restart_component
+    target_from: metadata.service
+    parameters: { strategy: rolling, max_unavailable: 1 }
+    policy_version: runbook:RB-17@v3
+    preconditions: [impact_confirmed, no_other_restart_in_10m]
+  - step: authorize
+    action: authorize
+    role: on_call
+    policy: { mode: human, approver_role: on_call }
+  - step: dispatch
+    action: dispatch
+    role: remediation_reviewer
+  - step: verify
+    action: verify
+    role: recovery_verifier
+    on_recovered: resolve
+    on_not_recovered: propose_rollback
+  - step: propose_rollback
+    action: propose_action
+    role: remediation_reviewer
+    plan_step: rollback_deployment
+    target_from: metadata.service
+    parameters: { to: previous_stable }
+    policy_version: runbook:RB-02@v5
+    preconditions: [restart_verified_failed, previous_version_available]
+  - step: authorize_rollback
+    action: authorize
+    role: on_call
+    policy: { mode: human, approver_role: on_call }
+  - step: dispatch_rollback
+    action: dispatch
+    role: remediation_reviewer
+  - step: verify_rollback
+    action: verify
+    role: recovery_verifier
+  - step: resolve
+    action: transition
+    to: resolved
+    role: coordinator
+  - step: status_update
+    action: notify
+    channel: status-page
+    template: incident_resolved
+    role: coordinator
+  - step: postmortem
+    action: record
+    artifact: postmortem_draft
+    role: coordinator
+    description: Blameless draft from recorded history; pending review before promotion.
+
+outputs:
+  - Incident episodes with correct counts (observations vs duplicate deliveries)
+  - Investigation findings with evidence references
+  - Action ledger entries (operation id, approval, attempts, verification)
+  - Postmortem draft (pending review)
+
+kpis:
+  - { name: model_calls_avoided, description: duplicates + evidence-only updates that never reached the LLM }
+  - { name: time_to_useful_triage, target: "< 5 min" }
+  - { name: verified_restoration_time, description: from first observation to independent verification }
+  - { name: duplicate_side_effects, target: "0" }
+  - { name: false_merges_false_splits, description: against reviewed incident labels }
+
+guardrails:
+  - Paging never waits for investigation output.
+  - An agent message never changes incident state; transitions are explicit and recorded.
+  - Retries reuse the operation id; a lost response is reconciled, not retried blindly.
+  - Missing telemetry is unknown, never recovery.
+  - Logs and traces are untrusted input.

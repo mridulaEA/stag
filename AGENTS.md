@@ -24,8 +24,12 @@ python -m stag.skills install --target all          # ~/.claude/skills, ~/.agent
 |---|---|
 | TechOps incident workflow | `stag-techops-incident-triage`, `stag-techops-dedup-correlation`, `stag-techops-bounded-investigation`, `stag-techops-remediation-ledger`, `stag-techops-recovery-verification`, `stag-techops-postmortem` |
 | TechOps platform | `stag-techops-signal-tuning`, `stag-techops-resilience-tests`, `stag-techops-enterprise-onboarding` |
-| Multi-agent | `stag-multi-agent-orchestration` (roles in `agents/`) |
+| Use-case workflows | `stag-problem-management`, `stag-release-gate`, `stag-ai-automation-governance`, `stag-customer-care-comms`, `stag-log-analysis`, `stag-dataops-pipeline-triage`, `stag-security-governance` |
+| Multi-agent & crews | `stag-multi-agent-orchestration` (roles in `agents/`), `stag-crew-authoring` (crews in `crews/`) |
 | Development | `stag-trigger-rule-authoring`, `stag-stream-adapter`, `stag-skill-authoring` |
+
+Crews (`crews/<name>/crew.yaml`) are ready-made teams per use case; run and check them with
+`python -m stag.crews run-all --auto-approve` and `python -m pytest tests/test_crews.py`.
 
 Read the relevant skill before changing code in its area or before acting on an incident.
 
@@ -37,6 +41,8 @@ pip install -e ".[dev]"                    # + pytest, ruff
 python -m pytest tests -q                  # tests (techops + triggers run without ML deps)
 ruff check stag tests                      # lint (line length 100)
 python -m stag.skills validate             # skill frontmatter checks
+python -m stag.crews validate              # crew definitions vs skills/agents
+python -m stag.crews run-all --auto-approve   # every crew end-to-end (offline, deterministic executor)
 python -m stag.main                        # run API at :8000 (simulator stream)
 cd frontend && npm install && npm run dev  # dashboard at :5173
 ```
@@ -51,7 +57,9 @@ cd frontend && npm install && npm run dev  # dashboard at :5173
   generation when `TECHOPS_COORDINATOR_ENABLED=true`. Duplicate deliveries and evidence-only
   updates must never reach the LLM.
 - Trigger rules are pure functions of the event (`stag/triggers/rules.py`). Cadence/suppression
-  belongs to the coordinator, not to rules.
+  belongs to the coordinator, not to rules. Crews declare rules via `RuleRegistry.from_specs`.
+- `stag/crews/` runs declarative crews on the backbone. The schema has no step for direct
+  production mutation; `authorize` needs a `human: true` role or a severity-bounded policy (≤ medium).
 - Stream adapters preserve source identity: `StreamEvent.id` is the source's logical event id,
   never a replay cursor or a fresh UUID for a forwarded event.
 - Agents never change incident state, authorize, or dispatch. Those happen through explicit API

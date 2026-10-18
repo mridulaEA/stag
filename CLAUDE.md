@@ -5,9 +5,13 @@ adds Claude Code specifics.
 
 ## Skills and agents
 
-- Project skills: `.claude/skills` → `skills/` (13 skills; run `python -m stag.skills list`).
+- Project skills: `.claude/skills` → `skills/` (21 skills; run `python -m stag.skills list`).
+- Crews: `crews/<name>/crew.yaml` (8 ready-made teams; `python -m stag.crews list`). Author new ones
+  with the `stag-crew-authoring` skill; every crew must pass `tests/test_crews.py`.
 - Subagents in `agents/`: `stag-incident-coordinator`, `stag-investigator`,
-  `stag-remediation-reviewer`, `stag-recovery-verifier`. Use them per
+  `stag-remediation-reviewer`, `stag-recovery-verifier`, plus crew roles `stag-problem-analyst`,
+  `stag-release-gatekeeper`, `stag-automation-engineer`, `stag-customer-communicator`,
+  `stag-log-analyst`, `stag-data-steward`, `stag-security-analyst`. Use them per
   `skills/stag-multi-agent-orchestration/SKILL.md`; the main session acts as orchestrator and
   holds approvals.
 - Installable from anywhere as a plugin:
@@ -16,9 +20,9 @@ adds Claude Code specifics.
 ## Quick checks before finishing
 
 ```bash
-python -m pytest tests/test_techops.py tests/test_triggers.py tests/test_skills.py -q
+python -m pytest tests -q
 ruff check stag tests
-python -m stag.skills validate
+python -m stag.skills validate && python -m stag.crews validate
 ```
 
 ## Non-negotiables

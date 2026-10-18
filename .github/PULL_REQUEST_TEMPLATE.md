@@ -7,6 +7,7 @@
 - [ ] TechOps backbone (`stag/techops/`)
 - [ ] Trigger rule / stream adapter / retrieval / generation
 - [ ] Skill or agent definition (`skills/`, `agents/`)
+- [ ] Crew (`crews/<name>/crew.yaml` + `scenario.yaml` + `README.md`)
 - [ ] API / frontend
 - [ ] Docs / community
 
@@ -18,6 +19,7 @@
 - [ ] Relevant skill(s) updated to match behaviour
 - [ ] For backbone changes: resilience-test rows covered: <!-- e.g. 1, 4, 7 -->
 - [ ] For skills: folder name == `name`; description says what / when / when-not; tried in <!-- Claude Code / Codex / Cursor -->
+- [ ] For crews: human approver role present; `python -m stag.crews run <name>` halts at the gate and `--auto-approve` resolves; added to `crews/README.md`
 
 ## Linked issue / discussion
 

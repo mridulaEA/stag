@@ -1,0 +1,30 @@
+name: recurring-cache-evictions
+description: Three incidents in a week on the same service plus a ticket explicitly tagged as a recurring known error.
+events:
+  - source: stag-incidents
+    event_type: alert
+    severity: medium
+    payload: { summary: "cache eviction storm", category: incident }
+    metadata: { service: catalog-api, environment: production }
+  - source: stag-incidents
+    event_type: alert
+    severity: medium
+    payload: { summary: "cache eviction storm", category: incident }
+    metadata: { service: catalog-api, environment: production }
+  - source: stag-incidents
+    event_type: alert
+    severity: high
+    payload: { summary: "cache eviction storm", category: incident }
+    metadata: { service: catalog-api, environment: production }
+  - source: servicenow
+    event_type: ticket
+    severity: medium
+    payload: { summary: "workaround applied again: flush cache", category: "known-error recurring" }
+    metadata: { service: catalog-api, environment: production }
+  - source: stag-incidents
+    event_type: alert
+    severity: low
+    payload: { summary: "one-off latency blip", category: incident }
+    metadata: { service: search-api, environment: production }
+verification: { default: healthy }
+expect: { incidents_at_least: 1, resolved_with_auto_approve_at_least: 1, held_without_auto_approve_at_least: 1, operations_at_least: 1 }

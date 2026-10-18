@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stag"
-version = "0.2.0"
+version = "0.3.0"
 description = "STAG — Stream-Triggered Augmented Generation. Proactive AI that monitors data streams, detects events, and generates insights autonomously."
 readme = "README.md"
 license = {text = "MIT"}
@@ -47,12 +47,13 @@ dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
-    "ruff>=0.2.0",
+    "ruff>=0.3.0",
 ]
 
 [project.scripts]
 stag = "stag.main:cli"
 stag-skills = "stag.skills.cli:main"
+stag-crews = "stag.crews.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["stag*"]

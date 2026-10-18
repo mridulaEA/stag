@@ -120,7 +120,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="STAG",
         description="Stream-Triggered Augmented Generation — Proactive AI for enterprise data streams",
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
 
@@ -152,7 +152,7 @@ def cli():
     settings = get_settings()
     print(f"""
 ╔══════════════════════════════════════════════════╗
-║              STAG v0.2.0                         ║
+║              STAG v0.3.0                         ║
 ║  Stream-Triggered Augmented Generation           ║
 ║                                                  ║
 ║  Stream:  {settings.stream_source:<20s}             ║

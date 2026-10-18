@@ -1,0 +1,604 @@
+"""Crew runner: executes a crew's workflow end-to-end against the TechOps backbone.
+
+The runner is deterministic by construction. Every step maps onto a backbone operation:
+
+    coordinate      → IncidentCoordinator.ingest (dedup, correlate, material change)
+    transition      → coordinator.transition (explicit, recorded)
+    investigate     → InvestigationAssignment + BoundedRun (limits enforced) → findings
+    propose_action  → ActionLedger.prepare (deterministic operation id)
+    authorize       → ActionLedger.authorize by a human or by a severity-bounded policy; else HELD
+    dispatch        → ActionLedger.revalidate (staleness) + dispatch
+    verify          → ActionLedger.verify from independent evidence; RESOLVED or INVESTIGATING again
+    notify / record → provenance-tagged communications and *draft* artifacts
+
+Role executors supply the content (findings text, messages, artifact drafts). The default
+``DeterministicExecutor`` needs no LLM, so every crew can be checked end-to-end offline; plug an
+LLM-backed executor in for production and the control flow stays the same.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any, Protocol
+from uuid import uuid4
+
+from pydantic import BaseModel, Field
+
+from stag.crews.schema import (
+    AuthorizePolicy,
+    Crew,
+    Role,
+    Scenario,
+    Step,
+    StepAction,
+)
+from stag.models.schemas import EventType, Severity, StreamEvent, TriggerResult
+from stag.techops import (
+    ActionLedger,
+    ActionRecord,
+    ActionState,
+    BudgetExhausted,
+    BudgetLedger,
+    Incident,
+    IncidentCoordinator,
+    IncidentState,
+    InvalidTransition,
+    InvestigationAssignment,
+    InvestigationFindings,
+    LimitExceeded,
+    PermissionDenied,
+    SignalKey,
+)
+from stag.techops.assignment import (
+    AssignmentLimits,
+    AssignmentPermissions,
+    AssignmentScope,
+    Fact,
+)
+from stag.triggers import RuleRegistry, TriggerEngine
+
+SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+MAX_REINVESTIGATION_LOOPS = 2
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _lookup(event: StreamEvent, dotted: str, default: str = "unknown") -> str:
+    """Resolve ``metadata.service`` / ``payload.region`` / ``source`` against an event."""
+    head, _, rest = dotted.partition(".")
+    container: Any
+    if head == "metadata":
+        container = event.metadata
+    elif head == "payload":
+        container = event.payload
+    elif head == "source":
+        return event.source
+    else:
+        return default
+    value = container.get(rest) if isinstance(container, dict) else None
+    return str(value) if value not in (None, "") else default
+
+
+# --------------------------------------------------------------------------- executors
+
+
+class RoleExecutor(Protocol):
+    """Content provider for the roles. The runner owns control flow and enforcement."""
+
+    def investigate(
+        self, crew: Crew, role: Role, incident: Incident, run: Any, evidence: dict[str, Any]
+    ) -> InvestigationFindings: ...
+
+    def verify(
+        self, crew: Crew, incident: Incident, action: ActionRecord | None, hint: str
+    ) -> tuple[bool | None, dict[str, Any]]: ...
+
+    def notify(
+        self, crew: Crew, step: Step, incident: Incident, context: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def record(
+        self, crew: Crew, step: Step, incident: Incident, context: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+
+class DeterministicExecutor:
+    """Template-based executor: produces structured, evidence-referenced output without an LLM."""
+
+    def investigate(self, crew, role, incident, run, evidence):
+        caps = run.assignment.permissions.capabilities
+        used = []
+        for cap in caps[: min(3, run.assignment.limits.max_tool_calls)]:
+            try:
+                run.use_capability(cap, incident_id=incident.id)
+                used.append(cap)
+            except (PermissionDenied, LimitExceeded):
+                break
+        try:
+            run.record_model_call()
+        except LimitExceeded:
+            pass
+
+        attrs = incident.attributes
+        refs = [f"incident:{incident.id}@v{incident.version}"] + [
+            f"obs:{o}" for o in incident.example_observation_ids[:2]
+        ]
+        facts = [
+            Fact(
+                statement=(
+                    f"{incident.observation_count} distinct observation(s) of "
+                    f"'{attrs.get('symptom_class')}' on {attrs.get('service')} "
+                    f"({attrs.get('environment')}); {incident.duplicate_delivery_count} duplicate "
+                    f"deliveries counted separately"
+                ),
+                evidence_refs=refs,
+            )
+        ]
+        if incident.signatures:
+            facts.append(
+                Fact(
+                    statement=f"failure signatures observed: {', '.join(incident.signatures[:5])}",
+                    evidence_refs=refs[:1],
+                )
+            )
+        missing = []
+        if "inspect_deployment_metadata" not in used:
+            missing.append("deployment metadata not retrieved (capability not used or not granted)")
+        if "read_service_health" not in used:
+            missing.append("current service health not read")
+        next_step = evidence.get("next_plan_step")
+        return InvestigationFindings(
+            observed_facts_with_references=facts,
+            hypotheses=[
+                f"{attrs.get('symptom_class')} on {attrs.get('service')} is a continuing condition "
+                f"(severity {incident.severity.value}); a recent change is a candidate contributor, not a confirmed cause"
+            ],
+            contradictory_or_missing_evidence=missing or ["none identified within the bounded evidence package"],
+            proposed_next_step=(
+                f"propose bounded step '{next_step}' for review" if next_step else "continue monitoring; no action proposed"
+            ),
+        )
+
+    def verify(self, crew, incident, action, hint):
+        verdict = {"healthy": True, "not_recovered": False, "unknown": None}.get(hint, True)
+        evidence = {
+            "window": "observation window per crew policy",
+            "signals": ["service_health", "impact_metric", "telemetry_freshness"],
+            "hint": hint,
+        }
+        return verdict, evidence
+
+    def notify(self, crew, step, incident, context):
+        return {
+            "channel": step.channel,
+            "template": step.template,
+            "incident_id": incident.id,
+            "operation_ids": context.get("operation_ids", []),
+            "message": (
+                f"[{crew.display_name}] {incident.attributes.get('service')}: "
+                f"{incident.attributes.get('symptom_class')} — state {incident.state.value}, "
+                f"severity {incident.severity.value}, {incident.observation_count} observation(s)"
+            ),
+        }
+
+    def record(self, crew, step, incident, context):
+        return {
+            "artifact": step.artifact,
+            "status": "draft — pending review",
+            "incident_id": incident.id,
+            "timeline": [
+                {"at": t.at.isoformat(), "from": t.from_state.value, "to": t.to_state.value, "actor": t.actor, "reason": t.reason}
+                for t in incident.history
+            ],
+            "actions": context.get("operation_ids", []),
+            "findings": context.get("findings"),
+        }
+
+
+# --------------------------------------------------------------------------- run records
+
+
+class StepRecord(BaseModel):
+    step: str
+    action: StepAction
+    role: str | None = None
+    status: str  # done | held | skipped | failed | awaiting
+    detail: dict[str, Any] = Field(default_factory=dict)
+    at: datetime = Field(default_factory=_now)
+
+
+class IncidentRun(BaseModel):
+    incident_id: str
+    signal_key: str
+    severity: str
+    final_state: str
+    steps: list[StepRecord] = Field(default_factory=list)
+    operation_ids: list[str] = Field(default_factory=list)
+    halted_at: str | None = None
+    halt_reason: str | None = None
+
+
+class CrewRunReport(BaseModel):
+    run_id: str = Field(default_factory=lambda: f"RUN-{uuid4().hex[:8]}")
+    crew: str
+    scenario: str
+    started_at: datetime = Field(default_factory=_now)
+    events_ingested: int = 0
+    triggers_fired: int = 0
+    duplicate_deliveries: int = 0
+    conflicting_deliveries: int = 0
+    evidence_only_updates: int = 0
+    investigations_requested: int = 0
+    incidents: list[IncidentRun] = Field(default_factory=list)
+    notifications: list[dict[str, Any]] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    budget: dict[str, Any] = Field(default_factory=dict)
+    ledger: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def model_calls_avoided(self) -> int:
+        return self.duplicate_deliveries + self.evidence_only_updates
+
+    @property
+    def resolved(self) -> int:
+        return sum(1 for i in self.incidents if i.final_state == IncidentState.RESOLVED.value)
+
+    @property
+    def held(self) -> int:
+        return sum(1 for i in self.incidents if i.halted_at is not None)
+
+    def to_markdown(self) -> str:
+        lines = [
+            f"# Crew run {self.run_id}: {self.crew} / {self.scenario}",
+            "",
+            f"- events ingested: {self.events_ingested}; triggers fired: {self.triggers_fired}",
+            f"- duplicate deliveries: {self.duplicate_deliveries}; conflicting: {self.conflicting_deliveries}; "
+            f"evidence-only updates: {self.evidence_only_updates}",
+            f"- investigations requested: {self.investigations_requested}; **model calls avoided: {self.model_calls_avoided}**",
+            f"- incidents: {len(self.incidents)}; resolved: {self.resolved}; halted/awaiting: {self.held}",
+            f"- budget: {self.budget}",
+            "",
+        ]
+        for inc in self.incidents:
+            lines.append(f"## {inc.incident_id} — {inc.signal_key} (severity {inc.severity}) → {inc.final_state}")
+            for s in inc.steps:
+                extra = ""
+                if s.detail.get("operation_id"):
+                    extra = f" · op {s.detail['operation_id']}"
+                if s.detail.get("reason"):
+                    extra += f" · {s.detail['reason']}"
+                lines.append(f"- `{s.step}` ({s.action.value}, {s.role or 'system'}): **{s.status}**{extra}")
+            if inc.halted_at:
+                lines.append(f"- ⏸ halted at `{inc.halted_at}`: {inc.halt_reason}")
+            lines.append("")
+        if self.notifications:
+            lines.append(f"Notifications: {len(self.notifications)} · Artifacts (drafts): {len(self.artifacts)}")
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- runner
+
+
+class CrewRunner:
+    def __init__(
+        self,
+        crew: Crew,
+        executor: RoleExecutor | None = None,
+        auto_approve: bool = False,
+        approver: str = "human:on-call",
+    ) -> None:
+        self.crew = crew
+        self.executor = executor or DeterministicExecutor()
+        self.auto_approve = auto_approve
+        self.approver = approver
+
+        registry = RuleRegistry.from_specs([t.model_dump() for t in crew.triggers]) if crew.triggers else RuleRegistry.default()
+        self.engine = TriggerEngine(registry)
+        self.coordinator = IncidentCoordinator(signal_key_fn=self._signal_key, **crew.coordinator)
+        self.ledger = ActionLedger()
+        self.budget = BudgetLedger(crew.budget_allocation, name=crew.name)
+        self._first_event: dict[str, StreamEvent] = {}
+        self._verification_hints: dict[str, str] = {}
+        self.notifications: list[dict[str, Any]] = []
+        self.artifacts: list[dict[str, Any]] = []
+
+    # ----------------------------------------------------------------- coordinate
+
+    def _signal_key(self, event: StreamEvent, trigger: TriggerResult) -> SignalKey:
+        spec = self.crew.signal_key
+        return SignalKey(
+            tenant=self.coordinator.tenant,
+            environment=_lookup(event, spec.environment),
+            service=_lookup(event, spec.service, default=event.source),
+            failure_domain=event.event_type.value if spec.failure_domain_from_event_type else "any",
+            symptom_class=trigger.rule_name if spec.symptom_from_rule else "signal",
+        )
+
+    def ingest(self, event: StreamEvent):
+        trigger = self.engine.evaluate(event)
+        decision = self.coordinator.ingest(event, trigger)
+        if decision.incident_id and decision.incident_id not in self._first_event:
+            self._first_event[decision.incident_id] = event
+        return trigger, decision
+
+    # ----------------------------------------------------------------- scenario
+
+    @staticmethod
+    def _expand(scenario: Scenario) -> list[StreamEvent]:
+        events: list[StreamEvent] = []
+        for spec in scenario.events:
+            for _ in range(max(1, spec.repeat)):
+                kwargs: dict[str, Any] = dict(
+                    source=spec.source,
+                    event_type=EventType(spec.event_type),
+                    severity=Severity(spec.severity),
+                    payload=dict(spec.payload),
+                    metadata=dict(spec.metadata),
+                )
+                if spec.id:
+                    kwargs["id"] = spec.id  # same identity on every repeat → redelivery
+                events.append(StreamEvent(**kwargs))
+        return events
+
+    def run_scenario(self, scenario: Scenario) -> CrewRunReport:
+        report = CrewRunReport(crew=self.crew.name, scenario=scenario.name)
+        self._verification_hints = dict(scenario.verification)
+        for event in self._expand(scenario):
+            trigger, decision = self.ingest(event)
+            report.events_ingested += 1
+            if trigger is not None:
+                report.triggers_fired += 1
+            if decision.duplicate:
+                report.duplicate_deliveries += 1
+            elif decision.conflicting:
+                report.conflicting_deliveries += 1
+            elif decision.incident_id and decision.investigation_request is None:
+                report.evidence_only_updates += 1
+            if decision.investigation_request is not None:
+                report.investigations_requested += 1
+
+        for incident in self.coordinator.open_incidents:
+            if incident.last_investigation_version is None:
+                continue
+            report.incidents.append(self.run_workflow(incident))
+
+        report.budget = self.budget.stats
+        report.ledger = self.ledger.stats
+        report.notifications = list(self.notifications)
+        report.artifacts = list(self.artifacts)
+        return report
+
+    # ----------------------------------------------------------------- workflow
+
+    def run_workflow(self, incident: Incident) -> IncidentRun:
+        run = IncidentRun(
+            incident_id=incident.id,
+            signal_key=incident.signal_key,
+            severity=incident.severity.value,
+            final_state=incident.state.value,
+        )
+        steps = self.crew.workflow
+        index = 1  # step 0 is coordinate (already done at ingest)
+        context: dict[str, Any] = {"operation_ids": [], "findings": None, "loops": 0, "verifications": 0}
+        while index < len(steps):
+            step = steps[index]
+            try:
+                record, jump = self._execute(step, incident, context)
+            except Exception as e:  # a bug in a step must surface, not be swallowed
+                record = StepRecord(step=step.step, action=step.action, role=step.role, status="failed", detail={"error": str(e)})
+                jump = None
+                run.steps.append(record)
+                run.halted_at, run.halt_reason = step.step, f"error: {e}"
+                break
+            run.steps.append(record)
+            if record.status in ("held", "awaiting"):
+                run.halted_at, run.halt_reason = step.step, record.detail.get("reason", record.status)
+                break
+            if jump is not None:
+                index = jump
+                continue
+            index += 1
+        run.operation_ids = list(context["operation_ids"])
+        run.final_state = incident.state.value
+        return run
+
+    def _ensure(
+        self,
+        incident: Incident,
+        target: IncidentState,
+        actor: str,
+        reason: str,
+        via: list[IncidentState] | tuple[IncidentState, ...] = (),
+    ) -> list[str]:
+        """Bring the incident to ``target`` through permitted intermediate states, recording each."""
+        applied: list[str] = []
+        if incident.state is target:
+            return applied
+        for state in [*via, target]:
+            if incident.state is state:
+                continue
+            if incident.can_transition(state):
+                self.coordinator.transition(incident.id, state, actor=actor, reason=reason)
+                applied.append(state.value)
+        if incident.state is not target:
+            raise InvalidTransition(f"{incident.id}: cannot reach {target.value} from {incident.state.value}")
+        return applied
+
+    def _execute(self, step: Step, incident: Incident, context: dict[str, Any]) -> tuple[StepRecord, int | None]:
+        actor = f"role:{step.role}" if step.role else "crew"
+        detail: dict[str, Any] = {}
+
+        if step.action is StepAction.COORDINATE:
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": "coordinate runs at ingest"}), None
+
+        if step.action is StepAction.TRANSITION:
+            if incident.state is step.to:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": f"already {step.to.value}"}), None
+            self.coordinator.transition(incident.id, step.to, actor=actor, reason=step.description or step.step)
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail={"to": step.to.value}), None
+
+        if step.action is StepAction.INVESTIGATE:
+            role = self.crew.role(step.role) if step.role else None
+            spec = step.assignment
+            caps = (spec.capabilities if spec and spec.capabilities else (role.permissions.capabilities if role else []))
+            assignment = InvestigationAssignment(
+                scope=AssignmentScope(
+                    incident_id=incident.id,
+                    service_ids=[str(incident.attributes.get("service", "unknown"))],
+                    environment=str(incident.attributes.get("environment", "unknown")),
+                    evidence_snapshot=f"{incident.id}-evidence-v{incident.version}",
+                ),
+                permissions=AssignmentPermissions(capabilities=caps, production_mutations=bool(role and role.permissions.production_mutations)),
+                limits=AssignmentLimits(
+                    max_model_calls=spec.max_model_calls if spec else 4,
+                    max_tool_calls=spec.max_tool_calls if spec else 8,
+                    max_runtime_seconds=spec.max_runtime_seconds if spec else 120,
+                    budget_profile=spec.budget_profile if spec else "standard-investigation",
+                ),
+            )
+            detail["implicit_transitions"] = self._ensure(
+                incident, IncidentState.INVESTIGATING, actor, step.step, via=[IncidentState.TRIAGED]
+            )
+            ref = f"{incident.id}:{step.step}:v{incident.version}"
+            try:
+                self.budget.reserve(ref, 1.0 * assignment.limits.max_model_calls)
+            except BudgetExhausted as e:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="held", detail={"reason": f"budget exhausted: {e}"}), None
+            bounded = assignment.start()
+            next_plan = next((s.plan_step for s in self.crew.workflow if s.action is StepAction.PROPOSE_ACTION), None)
+            findings = self.executor.investigate(self.crew, role, incident, bounded, {"next_plan_step": next_plan})
+            findings = bounded.finish(findings)
+            self.budget.settle(ref, float(bounded.model_calls))
+            context["findings"] = findings.model_dump(mode="json")
+            detail.update(
+                {
+                    "evidence_snapshot": assignment.scope.evidence_snapshot,
+                    "capabilities_used": [c["capability"] for c in bounded.capability_log],
+                    "denied": bounded.denied,
+                    "model_calls": bounded.model_calls,
+                    "partial": findings.partial,
+                    "facts": len(findings.observed_facts_with_references),
+                    "proposed_next_step": findings.proposed_next_step,
+                }
+            )
+            if findings.partial and findings.escalate:
+                detail["reason"] = "partial findings; escalated"
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), None
+
+        if step.action is StepAction.PROPOSE_ACTION:
+            first = self._first_event.get(incident.id)
+            target = _lookup(first, step.target_from, default=str(incident.attributes.get("service", "unknown"))) if first else str(incident.attributes.get("service", "unknown"))
+            record = self.ledger.prepare(
+                incident.id, step.plan_step, target, dict(step.parameters),
+                policy_version=step.policy_version, preconditions=list(step.preconditions),
+            )
+            if record.operation_id not in context["operation_ids"]:
+                context["operation_ids"].append(record.operation_id)
+            detail.update({"operation_id": record.operation_id, "target": target, "state": record.state.value})
+            detail["implicit_transitions"] = self._ensure(incident, IncidentState.ACTION_PROPOSED, actor, step.step)
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), None
+
+        if step.action is StepAction.AUTHORIZE:
+            policy = step.policy or AuthorizePolicy()
+            op_id = context["operation_ids"][-1] if context["operation_ids"] else None
+            if op_id is None:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": "no proposed action"}), None
+            record = self.ledger.get(op_id)
+            if record.state is ActionState.STALE:
+                pass  # re-authorization path below
+            elif record.state is not ActionState.PREPARED:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": f"operation already {record.state.value}", "operation_id": op_id}), None
+            severity_ok = (
+                policy.mode == "policy"
+                and policy.auto_if_severity_at_most is not None
+                and SEVERITY_ORDER[incident.severity.value] <= SEVERITY_ORDER[policy.auto_if_severity_at_most]
+            )
+            if severity_ok:
+                who = f"policy:{step.step}"
+            elif self.auto_approve:
+                who = self.approver
+            else:
+                self._ensure(incident, IncidentState.HELD, actor, "awaiting human authorization")
+                return StepRecord(
+                    step=step.step, action=step.action, role=step.role, status="held",
+                    detail={"operation_id": op_id, "reason": "awaiting human authorization (run with auto_approve or approve via /api/techops/actions)"},
+                ), None
+            # Record the lifecycle transition first so the approval is bound to the resulting version;
+            # any later evidence or state change then makes the approval STALE at dispatch time.
+            detail["implicit_transitions"] = self._ensure(incident, IncidentState.AUTHORIZED, who, step.step)
+            self.ledger.authorize(op_id, actor=who, incident_version=incident.version, note=step.description or step.step)
+            detail.update({"operation_id": op_id, "authorized_by": who, "incident_version": incident.version})
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), None
+
+        if step.action is StepAction.DISPATCH:
+            op_id = context["operation_ids"][-1] if context["operation_ids"] else None
+            if op_id is None:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": "no action to dispatch"}), None
+            record = self.ledger.revalidate(op_id, incident.version)
+            if record.state is ActionState.STALE:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="held", detail={"operation_id": op_id, "reason": "approval stale; incident changed since authorization"}), None
+            if record.state is not ActionState.AUTHORIZED:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"operation_id": op_id, "reason": f"operation is {record.state.value}"}), None
+            self.ledger.dispatch(op_id, actor=actor)
+            detail.update({"operation_id": op_id, "attempts": record.dispatch_attempts})
+            detail["implicit_transitions"] = self._ensure(incident, IncidentState.EXECUTING, actor, step.step)
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), None
+
+        if step.action is StepAction.VERIFY:
+            context["verifications"] += 1
+            op_id = context["operation_ids"][-1] if context["operation_ids"] else None
+            record = self.ledger.get(op_id) if op_id else None
+            hints = self._verification_hints
+            hint = hints.get(
+                f"{incident.signal_key}#{context['verifications']}",
+                hints.get(incident.signal_key, hints.get("default", "healthy")),
+            )
+            healthy, evidence = self.executor.verify(self.crew, incident, record, hint)
+            verdict = {True: "healthy", False: "not_recovered", None: "unknown"}[healthy]
+            detail.update({"operation_id": op_id, "verdict": verdict, "evidence": evidence})
+            detail["implicit_transitions"] = self._ensure(incident, IncidentState.VERIFYING, actor, step.step)
+            if healthy is None:
+                return StepRecord(
+                    step=step.step, action=step.action, role=step.role, status="awaiting",
+                    detail={**detail, "reason": "telemetry missing or stale; recovery unknown — not resolving"},
+                ), None
+            if record is not None and record.state is ActionState.DISPATCHED:
+                self.ledger.verify(op_id, healthy=healthy, evidence=evidence, actor=actor)
+            if healthy:
+                jump = self._index_of(step.on_recovered) if step.on_recovered else None
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), jump
+            self.coordinator.transition(
+                incident.id, IncidentState.INVESTIGATING, actor=actor, reason="verification failed: impact persists"
+            )
+            context["loops"] += 1
+            if step.on_not_recovered and context["loops"] <= MAX_REINVESTIGATION_LOOPS:
+                detail["reason"] = f"not recovered; continuing at '{step.on_not_recovered}' (attempt {context['loops'] + 1})"
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), self._index_of(step.on_not_recovered)
+            return StepRecord(
+                step=step.step, action=step.action, role=step.role, status="held",
+                detail={**detail, "reason": "not recovered; escalate to human"},
+            ), None
+
+        if step.action is StepAction.NOTIFY:
+            message = self.executor.notify(self.crew, step, incident, context)
+            message.setdefault("incident_id", incident.id)
+            self.notifications.append(message)
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail={"channel": step.channel}), None
+
+        if step.action is StepAction.RECORD:
+            artifact = self.executor.record(self.crew, step, incident, context)
+            artifact.setdefault("incident_id", incident.id)
+            self.artifacts.append(artifact)
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail={"artifact": step.artifact, "status": artifact.get("status")}), None
+
+        return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": "unknown action"}), None
+
+    def _index_of(self, step_name: str) -> int:
+        return next(i for i, s in enumerate(self.crew.workflow) if s.step == step_name)
+
+
+def run_crew(crew: Crew, scenario: Scenario, auto_approve: bool = False, executor: RoleExecutor | None = None) -> CrewRunReport:
+    runner = CrewRunner(crew, executor=executor, auto_approve=auto_approve)
+    return runner.run_scenario(scenario)

@@ -8,7 +8,7 @@ Named after the concept of **Stream-Triggered Augmented Generation** — where t
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python) ![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green?logo=fastapi) ![React](https://img.shields.io/badge/React-18.3-blue?logo=react) ![License](https://img.shields.io/badge/License-MIT-green) ![Skills](https://img.shields.io/badge/Agent%20Skills-Claude%20Code%20%7C%20Codex%20%7C%20Cursor-purple)
 
-> **New in 0.2:** a [TechOps backbone](#techops-deterministic-backbone-bounded-agents) (dedup, incident lifecycle, bounded investigation, retry-safe actions) and a [skill pack](#agent-skills-claude-code-codex-cursor) that works in Claude Code, Codex and Cursor. Start with [`skills/README.md`](skills/README.md).
+> **New in 0.3:** a [TechOps backbone](#techops-deterministic-backbone-bounded-agents) (dedup, incident lifecycle, bounded investigation, retry-safe actions), a [skill pack](#agent-skills-claude-code-codex-cursor) that works in Claude Code, Codex and Cursor, and eight ready-made [crews](#crews-ready-made-teams-per-use-case) (incident triage, problem management, release management, AI automation, customer care, log management, data ops, security governance) that run end-to-end. Start with [`crews/README.md`](crews/README.md).
 
 ---
 
@@ -248,6 +248,7 @@ stag/
 │   │   ├── actions.py            # Retry-safe action ledger
 │   │   └── budget.py             # Reserve/settle admission control
 │   ├── skills/                    # `stag-skills` CLI (list / validate / install)
+│   ├── crews/                     # Crew schema, loader, runner (`stag-crews` CLI)
 │   ├── pipeline/                  # Pipeline orchestration
 │   │   └── orchestrator.py       # Stream → Trigger → (Coordinate) → Retrieve → Generate
 │   ├── api/                       # FastAPI layer
@@ -263,11 +264,14 @@ stag/
 │   │   └── hooks/useWebSocket.js # WebSocket connection hook
 │   ├── package.json
 │   └── vite.config.js            # Dev proxy to backend
+├── crews/                         # Ready-made teams: crew.yaml + scenario.yaml + README per use case
 ├── skills/                        # Agent skill pack (Claude Code / Codex / Cursor)
 │   ├── stag-techops-*/SKILL.md   # TechOps workflows
-│   ├── stag-multi-agent-orchestration/
+│   ├── stag-{problem-management,release-gate,ai-automation-governance,customer-care-comms,
+│   │        log-analysis,dataops-pipeline-triage,security-governance}/   # per-crew workflows
+│   ├── stag-multi-agent-orchestration/, stag-crew-authoring/
 │   └── stag-*/                   # development skills
-├── agents/                        # Claude Code subagents (coordinator, investigator, reviewer, verifier)
+├── agents/                        # Claude Code subagents (11 roles)
 ├── .claude-plugin/                # plugin.json + marketplace.json (install from anywhere)
 ├── .claude/skills, .agents/skills # → ../skills (project discovery for Claude Code, Codex, Cursor)
 ├── AGENTS.md, CLAUDE.md, .cursor/rules/   # agent guidance per runtime
@@ -347,6 +351,9 @@ All configuration is via environment variables (or `.env` file):
 | `GET` | `/api/knowledge/graph/stats` | Knowledge graph statistics |
 | `POST` | `/api/pipeline/start` | Start the pipeline |
 | `POST` | `/api/pipeline/stop` | Stop the pipeline |
+| `GET` | `/api/crews` | Crew catalog (roles, skills, workflow, KPIs) |
+| `GET` | `/api/crews/{name}` | One crew with its bundled scenario |
+| `POST` | `/api/crews/{name}/run` | Dry-run a crew `{auto_approve, scenario?}` on an isolated coordinator/ledger |
 | `GET` | `/api/techops/incidents?open_only=true` | Incident episodes with dedup / correlation stats |
 | `GET` | `/api/techops/incidents/{id}` | One incident with history and its actions |
 | `POST` | `/api/techops/incidents/{id}/transition` | Explicit lifecycle transition `{to, actor, reason}` |
@@ -442,9 +449,39 @@ ledger.dispatch(op.operation_id)                 # retries reuse op.operation_id
 Design summary: [`docs/techops/README.md`](docs/techops/README.md). Tests mirroring the
 failure-scenario matrix: [`tests/test_techops.py`](tests/test_techops.py).
 
+## Crews: ready-made teams per use case
+
+A crew is roles (agents + skills + least permissions, with a **human approver**) plus a workflow
+written only in backbone operations, plus a scenario that proves it runs end-to-end — offline,
+with a deterministic executor, no API key needed.
+
+| Crew | Watches | Human gate |
+|---|---|---|
+| `techops-incident-triage` | error rate, latency, error signatures, alerts | on-call approves restart / rollback |
+| `problem-management` | recurring incidents, known-error tickets | change owner / CAB approves permanent fix |
+| `release-management` | canary regressions, emergency changes | policy ≤ medium, else release manager |
+| `ai-automation` | automation failure spikes, unknown outcomes, retry storms, cost | policy ≤ medium, else platform owner |
+| `customer-care` | ticket surges, CSAT drops, blocked journeys | care lead approves known-issue response |
+| `log-management` | error signatures, log bursts, collector lag | policy ≤ medium, else platform on-call |
+| `data-ops` | pipeline failures, quality drift, freshness SLA | dataset owner approves backfill |
+| `security-governance` | sensitive data to unsanctioned AI tools (STAG defaults) | CISO delegate approves DLP control |
+
+```bash
+python -m stag.crews list
+python -m stag.crews run techops-incident-triage                  # halts at the human gate → HELD
+python -m stag.crews run techops-incident-triage --auto-approve   # simulate the approver → RESOLVED
+python -m stag.crews run-all --auto-approve                       # check every crew end-to-end
+```
+
+Every crew run reports **model calls avoided** (duplicates + evidence-only updates), incidents
+resolved vs held, operations with approvals and verification, notifications with provenance and
+draft artifacts. The dashboard's **Crews** tab shows the catalog and runs dry runs; the API exposes
+`GET /api/crews` and `POST /api/crews/{name}/run`. Author your own with the `stag-crew-authoring`
+skill — see [`crews/README.md`](crews/README.md) and [`docs/crews/README.md`](docs/crews/README.md).
+
 ## Agent skills (Claude Code, Codex, Cursor)
 
-Thirteen skills in the open Agent Skills format live in [`skills/`](skills/) and are discovered
+Twenty-one skills in the open Agent Skills format live in [`skills/`](skills/) and are discovered
 automatically in this repo by Claude Code (`.claude/skills`), Codex and Cursor (`.agents/skills`).
 Use them from any other project or machine:
 
@@ -464,7 +501,8 @@ curl -fsSL https://raw.githubusercontent.com/mridulaEA/stag/main/scripts/install
 |---|---|
 | TechOps incident workflow | triage · dedup/correlation · bounded investigation · remediation ledger · recovery verification · postmortem |
 | TechOps platform | signal tuning · resilience tests · enterprise onboarding |
-| Multi-agent | `stag-multi-agent-orchestration` + Claude Code subagents in [`agents/`](agents/) |
+| Use-case workflows | problem management · release gate · AI automation governance · customer care comms · log analysis · DataOps pipeline triage · security governance |
+| Multi-agent & crews | `stag-multi-agent-orchestration`, `stag-crew-authoring` + 11 Claude Code subagents in [`agents/`](agents/) |
 | Development | trigger rule authoring · stream adapter · skill authoring |
 
 Full catalog and invocation per tool: [`skills/README.md`](skills/README.md).

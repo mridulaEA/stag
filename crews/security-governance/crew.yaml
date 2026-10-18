@@ -1,0 +1,102 @@
+name: security-governance
+display_name: Shadow AI & Data Governance Crew
+domain: security
+version: 1.0.0
+purpose: >
+  STAG's original scenario as a crew: detect sensitive data flowing to unsanctioned AI tools, policy
+  violations and anomalous usage from DLP, proxy and identity streams; correlate per tool and
+  department instead of per event; investigate exposure with bounded evidence; apply an approved
+  DLP control as one operation; verify the exposure stopped; and record a governance case.
+when_to_use: >
+  Enterprise AI governance — shadow AI usage, data exposure, acceptable-use violations — where the
+  security team wants deduplicated cases and controlled responses rather than an alert per prompt.
+
+stream:
+  sources: [dlp, secure-web-gateway, idp, casb]
+  event_types: [tool_usage, data_transfer, policy_violation, network_traffic, authentication, data_access]
+  notes: "uses STAG's default trigger rules; the simulator (STREAM_SOURCE=simulator) produces this stream"
+
+signal_key:
+  service: payload.tool
+  environment: payload.department
+
+triggers: []   # empty → RuleRegistry.default(): sensitive data, PII, source-code leak, frequency, volume, severity
+
+coordinator:
+  investigation_cooldown_seconds: 3600
+
+roles:
+  - id: security_analyst
+    title: Security / governance analyst
+    agent: stag-security-analyst
+    skills: [stag-security-governance, stag-techops-dedup-correlation, stag-techops-incident-triage]
+  - id: investigator
+    title: Exposure investigator
+    agent: stag-investigator
+    skills: [stag-techops-bounded-investigation]
+    permissions:
+      capabilities: [read_incident_history, read_dependency_graph, read_metrics, query_scoped_logs]
+  - id: ciso_delegate
+    title: CISO delegate (human)
+    human: true
+    skills: [stag-security-governance]
+  - id: verifier
+    title: Control verifier
+    agent: stag-recovery-verifier
+    skills: [stag-techops-recovery-verification]
+
+workflow:
+  - step: coordinate
+    action: coordinate
+    role: security_analyst
+  - step: triage
+    action: transition
+    to: triaged
+    role: security_analyst
+    description: One case per tool × department × rule; users are entities in the graph, not separate cases.
+  - step: exposure_investigation
+    action: investigate
+    role: investigator
+    assignment: { max_model_calls: 4, max_tool_calls: 8, max_runtime_seconds: 120, budget_profile: governance }
+  - step: propose_control
+    action: propose_action
+    role: security_analyst
+    plan_step: apply_dlp_block
+    target_from: payload.tool
+    parameters: { scope: sensitive_data_types_only, notify_users: true }
+    policy_version: aup-2026@v3
+    preconditions: [exposure_confirmed, sanctioned_alternative_available]
+  - step: authorize
+    action: authorize
+    role: ciso_delegate
+    policy: { mode: human, approver_role: ciso_delegate }
+  - step: dispatch
+    action: dispatch
+    role: security_analyst
+  - step: verify
+    action: verify
+    role: verifier
+    description: No further sensitive transfers to the tool over the window; sanctioned-tool adoption observed.
+  - step: resolve
+    action: transition
+    to: resolved
+    role: security_analyst
+  - step: notify_governance
+    action: notify
+    channel: governance-channel
+    template: governance_case_closed
+    role: security_analyst
+  - step: governance_case
+    action: record
+    artifact: governance_case
+    role: security_analyst
+
+outputs: [Governance cases per tool/department, DLP control operations with approvals, Verified exposure stop, Case records for audit]
+kpis:
+  - { name: cases_vs_raw_alerts, description: "how many alerts collapsed into one case" }
+  - { name: time_to_control_applied }
+  - { name: repeat_exposure_after_control, target: "0" }
+guardrails:
+  - Prompts and transferred content are never pasted into evidence; cite data types and identifiers.
+  - Controls apply to tools and data types, approved by a human; never auto-block a person.
+  - Classification labels propagate to every derived artifact.

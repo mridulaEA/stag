@@ -37,11 +37,24 @@ per folder, usable unchanged from **Claude Code**, **OpenAI Codex** and **Cursor
 | `stag-techops-resilience-tests` | adding a source, rule, action tool or coordinator change; "is this production-ready?" |
 | `stag-techops-enterprise-onboarding` | connecting a new app/SaaS; identity, normalization envelope, classification, eligible routes, budgets, cells |
 
-### Multi-agent
+### Use-case workflows (one per crew)
+
+| Skill | Use when | Crew |
+|---|---|---|
+| `stag-problem-management` | "this keeps happening"; known-error database; permanent fix via CAB | `problem-management` |
+| `stag-release-gate` | "is it safe to ship / roll back?"; canary regressions; change freezes | `release-management` |
+| `stag-ai-automation-governance` | runbook bots / agents fail, retry-storm, cost runaway; what to automate next | `ai-automation` |
+| `stag-customer-care-comms` | ticket surges, CSAT drops, status-page and customer comms during incidents | `customer-care` |
+| `stag-log-analysis` | error floods, noisy log pipelines, collector lag, observability cost | `log-management` |
+| `stag-dataops-pipeline-triage` | pipeline failures, quality drift, freshness SLA, backfills | `data-ops` |
+| `stag-security-governance` | shadow AI, DLP response, AI acceptable-use enforcement | `security-governance` |
+
+### Multi-agent and crews
 
 | Skill | Use when |
 |---|---|
 | `stag-multi-agent-orchestration` | splitting incident work across agents (coordinator, investigator, remediation reviewer, recovery verifier); handoff schemas; conflict rules. Claude Code subagents in [`../agents/`](../agents). |
+| `stag-crew-authoring` | you want a ready-made team for a use case or a new one: defines `crews/<name>/crew.yaml`, scenario and end-to-end check. Catalog in [`../crews/`](../crews). |
 
 ### STAG development
 

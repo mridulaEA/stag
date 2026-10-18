@@ -160,6 +160,84 @@ class DataVolumeRule(TriggerRule):
         )
 
 
+class NumericThresholdRule(TriggerRule):
+    """Fires when a numeric payload field crosses a threshold (``gt``, ``gte``, ``lt``, ``lte``).
+
+    Used by crews for error rates, lag, null ratios, CSAT, cost and other operational metrics.
+    Confidence grows with the distance from the threshold.
+    """
+
+    OPS = {
+        "gt": lambda v, t: v > t,
+        "gte": lambda v, t: v >= t,
+        "lt": lambda v, t: v < t,
+        "lte": lambda v, t: v <= t,
+    }
+
+    def __init__(self, name: str, field: str, threshold: float, op: str = "gt") -> None:
+        super().__init__(name, TriggerType.THRESHOLD)
+        if op not in self.OPS:
+            raise ValueError(f"op must be one of {sorted(self.OPS)}")
+        self.field = field
+        self.threshold = float(threshold)
+        self.op = op
+
+    def evaluate(self, event: StreamEvent) -> TriggerResult:
+        raw = event.payload.get(self.field)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return TriggerResult(
+                trigger_type=self.trigger_type,
+                rule_name=self.name,
+                fired=False,
+                confidence=0.0,
+                event_id=event.id,
+                reason=f"{self.field} missing or non-numeric",
+            )
+        fired = self.OPS[self.op](value, self.threshold)
+        if fired:
+            scale = abs(self.threshold) if self.threshold else 1.0
+            confidence = min(1.0, 0.5 + abs(value - self.threshold) / (scale * 2))
+        else:
+            confidence = 0.0
+        return TriggerResult(
+            trigger_type=self.trigger_type,
+            rule_name=self.name,
+            fired=fired,
+            confidence=confidence,
+            event_id=event.id,
+            reason=f"{self.field}={value} {self.op} {self.threshold}: {'fired' if fired else 'within bounds'}",
+            context={"field": self.field, "value": value, "threshold": self.threshold, "op": self.op},
+        )
+
+
+RULE_TYPES: dict[str, type[TriggerRule]] = {
+    "severity_threshold": SeverityThresholdRule,
+    "pattern": PatternMatchRule,
+    "sensitive_data": SensitiveDataRule,
+    "frequency": FrequencyRule,
+    "data_volume": DataVolumeRule,
+    "numeric_threshold": NumericThresholdRule,
+}
+
+
+def build_rule(spec: dict) -> TriggerRule:
+    """Build a rule from a declarative spec: ``{"type": ..., "name": ..., "params": {...}}``.
+
+    ``severity_threshold`` accepts ``min_severity`` as a string. Used by crew definitions.
+    """
+    rule_type = spec.get("type")
+    if rule_type not in RULE_TYPES:
+        raise ValueError(f"unknown rule type '{rule_type}'; choose from {sorted(RULE_TYPES)}")
+    params = dict(spec.get("params") or {})
+    if rule_type == "severity_threshold" and isinstance(params.get("min_severity"), str):
+        params["min_severity"] = Severity(params["min_severity"])
+    name = spec.get("name")
+    cls = RULE_TYPES[rule_type]
+    return cls(name, **params) if name else cls(**params)
+
+
 class RuleRegistry:
     """Registry of all active trigger rules."""
 
@@ -172,6 +250,14 @@ class RuleRegistry:
     @property
     def rules(self) -> list[TriggerRule]:
         return list(self._rules)
+
+    @classmethod
+    def from_specs(cls, specs: list[dict]) -> RuleRegistry:
+        """Create a registry from declarative rule specs (see ``build_rule``)."""
+        registry = cls()
+        for spec in specs:
+            registry.register(build_rule(spec))
+        return registry
 
     @classmethod
     def default(cls) -> RuleRegistry:

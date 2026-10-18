@@ -117,3 +117,18 @@ def test_coordinator_disabled_returns_404():
 
     routes.set_dependencies(NoCoord(), ws_manager=None)
     assert TestClient(app).get("/api/techops/incidents").status_code == 404
+
+
+def test_crews_catalog_and_dry_run(client):
+    crews = client.get("/api/crews").json()["crews"]
+    assert {c["name"] for c in crews} >= {"techops-incident-triage", "customer-care", "data-ops"}
+    one = client.get("/api/crews/techops-incident-triage").json()
+    assert one["scenario"]["events"]
+    assert client.get("/api/crews/nope").status_code == 404
+
+    held = client.post("/api/crews/techops-incident-triage/run", json={}).json()
+    assert held["held"] == 2 and held["resolved"] == 0
+    done = client.post("/api/crews/techops-incident-triage/run", json={"auto_approve": True}).json()
+    assert done["resolved"] == 2 and "model_calls_avoided" in done and done["markdown"].startswith("# Crew run")
+    # dry runs never touch the live coordinator
+    assert client.get("/api/techops/incidents").json()["stats"]["total_incidents"] == 1

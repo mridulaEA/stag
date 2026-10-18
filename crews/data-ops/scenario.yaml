@@ -1,0 +1,31 @@
+name: orders-fact-freshness-breach
+description: The orders fact pipeline fails twice, null ratio drifts, freshness SLA is breached; a separate dataset has a one-off row-count collapse.
+events:
+  - repeat: 2
+    source: airflow
+    event_type: pipeline_run
+    severity: high
+    payload: { status: failed, dag: orders_fact_daily, partition: "2026-10-17" }
+    metadata: { dataset: warehouse.orders_fact, environment: production }
+  - source: great-expectations
+    event_type: data_quality
+    severity: medium
+    payload: { status: completed, null_ratio: 0.12, column: customer_id, partition: "2026-10-17" }
+    metadata: { dataset: warehouse.orders_fact, environment: production }
+  - source: freshness-monitor
+    event_type: metric
+    severity: critical
+    payload: { freshness_lag_minutes: 185 }
+    metadata: { dataset: warehouse.orders_fact, environment: production }
+  - source: dbt
+    event_type: data_quality
+    severity: high
+    payload: { status: completed, row_count_delta_pct: -62 }
+    metadata: { dataset: warehouse.sessions_agg, environment: production }
+  - source: airflow
+    event_type: pipeline_run
+    severity: low
+    payload: { status: success, dag: inventory_snapshot }
+    metadata: { dataset: warehouse.inventory, environment: production }
+verification: { default: healthy }
+expect: { incidents: 2, investigations_at_least: 3, resolved_with_auto_approve: 2, held_without_auto_approve: 2 }

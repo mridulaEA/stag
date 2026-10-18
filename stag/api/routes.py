@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from stag.crews import CREWS_DIR, Scenario, discover_crews, load_crew, load_scenario, run_crew
 from stag.models import StreamEvent
 from stag.techops import ActionLedger, IncidentState
 
@@ -27,7 +28,7 @@ def set_dependencies(pipeline, ws_manager, action_ledger: ActionLedger | None = 
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 
 @router.get("/stats")
@@ -271,6 +272,88 @@ async def verify_action(operation_id: str, body: VerifyActionRequest):
     except Exception as e:
         raise HTTPException(409, str(e)) from e
     return record.model_dump(mode="json")
+
+
+# --- Crews ---
+
+
+class CrewRunRequest(BaseModel):
+    """Run a crew. Omit ``scenario`` to use the crew's bundled scenario."""
+
+    scenario: Scenario | None = None
+    auto_approve: bool = False
+
+
+def _crew_or_404(name: str):
+    try:
+        return load_crew(name, CREWS_DIR)
+    except FileNotFoundError:
+        raise HTTPException(404, f"unknown crew {name}") from None
+
+
+@router.get("/crews")
+async def list_crews(domain: str | None = None):
+    """Catalog of crews: roles, skills, workflow steps, KPIs."""
+    crews = discover_crews(CREWS_DIR)
+    if domain:
+        crews = [c for c in crews if c.domain == domain]
+    return {
+        "crews": [
+            {
+                "name": c.name,
+                "display_name": c.display_name,
+                "domain": c.domain,
+                "version": c.version,
+                "purpose": c.purpose.strip(),
+                "when_to_use": c.when_to_use.strip(),
+                "roles": [
+                    {"id": r.id, "title": r.title, "agent": r.agent, "human": r.human, "skills": r.skills}
+                    for r in c.roles
+                ],
+                "workflow": [
+                    {"step": s.step, "action": s.action.value, "role": s.role, "plan_step": s.plan_step,
+                     "to": s.to.value if s.to else None,
+                     "policy": s.policy.model_dump() if s.policy else None}
+                    for s in c.workflow
+                ],
+                "triggers": [t.model_dump() for t in c.triggers],
+                "kpis": [k.model_dump() for k in c.kpis],
+                "guardrails": c.guardrails,
+                "skills": c.skills,
+            }
+            for c in crews
+        ]
+    }
+
+
+@router.get("/crews/{name}")
+async def get_crew(name: str):
+    crew = _crew_or_404(name)
+    body = crew.model_dump(mode="json")
+    try:
+        body["scenario"] = load_scenario(crew).model_dump(mode="json")
+    except FileNotFoundError:
+        body["scenario"] = None
+    return body
+
+
+@router.post("/crews/{name}/run")
+async def run_crew_endpoint(name: str, body: CrewRunRequest | None = None):
+    """Run a crew end-to-end against a scenario (bundled by default) using the deterministic executor.
+
+    This is a dry run on an isolated coordinator/ledger: it never touches the live pipeline state.
+    Without ``auto_approve`` the run halts at the human gate, which is the expected production shape.
+    """
+    crew = _crew_or_404(name)
+    body = body or CrewRunRequest()
+    scenario = body.scenario or load_scenario(crew)
+    report = run_crew(crew, scenario, auto_approve=body.auto_approve)
+    data = report.model_dump(mode="json")
+    data.update(
+        {"model_calls_avoided": report.model_calls_avoided, "resolved": report.resolved, "held": report.held,
+         "markdown": report.to_markdown()}
+    )
+    return data
 
 
 # --- WebSocket ---

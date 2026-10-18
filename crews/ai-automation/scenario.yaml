@@ -1,0 +1,21 @@
+name: runbook-bot-retry-storm
+description: A runbook bot fails repeatedly with unknown outcomes and runaway cost; a second automation is fine.
+events:
+  - repeat: 6
+    source: automation-platform
+    event_type: automation_run
+    severity: medium
+    payload: { automation_id: bot-restart-cache, outcome: failed, failure_rate: 0.45, cost_usd: 4.2 }
+    metadata: { environment: production }
+  - source: automation-platform
+    event_type: automation_run
+    severity: high
+    payload: { automation_id: bot-restart-cache, outcome: unknown, failure_rate: 0.5, cost_usd: 61.0 }
+    metadata: { environment: production }
+  - source: automation-platform
+    event_type: automation_run
+    severity: low
+    payload: { automation_id: bot-rotate-keys, outcome: ok, failure_rate: 0.0, cost_usd: 0.3 }
+    metadata: { environment: production }
+verification: { default: healthy }
+expect: { incidents: 1, duplicate_deliveries: 0, resolved_with_auto_approve: 1, held_without_auto_approve: 1 }

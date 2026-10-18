@@ -24,10 +24,13 @@ jobs:
           pip install pydantic pydantic-settings structlog pyyaml fastapi httpx pytest pytest-asyncio ruff
       - name: Lint
         run: ruff check stag tests
-      - name: Validate skill pack
-        run: python -m stag.skills validate
-      - name: Test TechOps backbone, triggers, skills tooling, API
-        run: python -m pytest tests/test_techops.py tests/test_triggers.py tests/test_skills.py tests/test_techops_api.py -q
+      - name: Validate skill pack and crews
+        run: |
+          python -m stag.skills validate
+          python -m stag.crews validate
+          python -m stag.crews run-all --auto-approve > /dev/null
+      - name: Test TechOps backbone, triggers, skills tooling, crews, API
+        run: python -m pytest tests/test_techops.py tests/test_triggers.py tests/test_skills.py tests/test_crews.py tests/test_techops_api.py -q
 
   full:
     name: Full test suite
