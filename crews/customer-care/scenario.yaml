@@ -1,0 +1,28 @@
+name: checkout-wave-eu
+description: A wave of EU checkout complaints with duplicate submissions and a CSAT dip; one unrelated billing question.
+events:
+  - id: tkt-10001
+    repeat: 2
+    source: zendesk
+    event_type: ticket
+    severity: medium
+    payload: { product_area: checkout, text: "I cannot check out, button spins forever", csat: 2, journey: checkout }
+    metadata: { region: eu }
+  - repeat: 4
+    source: zendesk
+    event_type: ticket
+    severity: medium
+    payload: { product_area: checkout, text: "cannot checkout since this morning", journey: checkout }
+    metadata: { region: eu }
+  - source: nps
+    event_type: customer_feedback
+    severity: low
+    payload: { product_area: checkout, text: "charged twice!!", csat: 1 }
+    metadata: { region: eu }
+  - source: intercom
+    event_type: ticket
+    severity: low
+    payload: { product_area: billing, text: "how do I download my invoice?", csat: 5 }
+    metadata: { region: eu }
+verification: { default: healthy }
+expect: { incidents: 1, duplicate_deliveries: 1, investigations_at_least: 2, resolved_with_auto_approve: 1, held_without_auto_approve: 1 }

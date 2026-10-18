@@ -1,0 +1,40 @@
+name: Crew proposal
+description: Propose a ready-made crew (roles + workflow) for a use case
+labels: [crew, community]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Crew name
+      placeholder: oncall-handoff
+    validations:
+      required: true
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Use case and stream
+      description: What events flow in (sources, event types, key payload fields) and what "one episode" means (signal key).
+    validations:
+      required: true
+  - type: textarea
+    id: roles
+    attributes:
+      label: Roles
+      description: Agents + skills + least capabilities, and who the human approver is.
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Workflow
+      description: Steps using coordinate / transition / investigate / propose_action / authorize / dispatch / verify / notify / record.
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario sketch
+      description: A redelivery, repeated symptoms, a severity increase, a benign event, and what "recovered" means.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I read `skills/stag-crew-authoring/SKILL.md` and `crews/README.md`
+        - label: The crew has a human gate before any dispatch

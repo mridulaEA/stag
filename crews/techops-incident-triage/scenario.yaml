@@ -1,0 +1,52 @@
+name: checkout-pool-exhaustion
+description: >
+  A deploy of checkout-api is followed by connection-pool timeouts. The collector redelivers one
+  event three times; several instances report the same symptom; a second service (payments-api)
+  degrades and its first mitigation does not recover, forcing the rollback path.
+events:
+  - source: datadog
+    event_type: deployment
+    severity: low
+    payload: { message: "checkout-api v42 rolled out", version: v42 }
+    metadata: { service: checkout-api, environment: production }
+  - id: evt-checkout-err-1
+    repeat: 3
+    source: datadog
+    event_type: metric
+    severity: high
+    payload: { error_rate: 0.034, message: "pool exhausted waiting for connection", instance: i-1 }
+    metadata: { service: checkout-api, environment: production }
+  - repeat: 4
+    source: datadog
+    event_type: metric
+    severity: high
+    payload: { error_rate: 0.041, message: "pool exhausted waiting for connection", instance: i-2 }
+    metadata: { service: checkout-api, environment: production }
+  - source: datadog
+    event_type: metric
+    severity: critical
+    payload: { error_rate: 0.12, message: "pool exhausted waiting for connection", instance: i-3 }
+    metadata: { service: checkout-api, environment: production }
+  - repeat: 2
+    source: datadog
+    event_type: metric
+    severity: high
+    payload: { error_rate: 0.02, message: "upstream timeout to checkout-api" }
+    metadata: { service: payments-api, environment: production }
+  - source: datadog
+    event_type: metric
+    severity: low
+    payload: { error_rate: 0.001, message: "healthy" }
+    metadata: { service: search-api, environment: production }
+verification:
+  default: healthy
+  "default|production|payments-api|metric|error_rate_high#1": not_recovered
+  "default|production|payments-api|metric|error_rate_high#2": healthy
+expect:
+  incidents: 2
+  duplicate_deliveries: 2
+  evidence_only_updates: 5
+  investigations_at_most: 4
+  resolved_with_auto_approve: 2
+  held_without_auto_approve: 2
+  operations_at_least: 3

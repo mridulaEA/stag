@@ -1,0 +1,32 @@
+name: Bug report
+description: Something in STAG behaves incorrectly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Include the pipeline stage (stream / trigger / techops coordinator / retrieval / generation / API / frontend).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal event payload, config (`.env` values, secrets removed), and steps. For coordinator/ledger issues, the sequence of events and the resulting incident/action state.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: STAG version / commit
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [stream adapter, trigger rules, techops coordinator, action ledger, assignment contract, retrieval, generation, API, frontend, skills/tooling, docs]

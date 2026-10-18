@@ -1,0 +1,32 @@
+name: TechOps workflow change
+description: Propose a change to how STAG dedups, correlates, investigates, remediates or verifies
+labels: [techops]
+body:
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Lifecycle stage
+      options: [identity / dedup, correlation / material change, triage, bounded investigation, remediation ledger, recovery verification, budget / admission, postmortem, signal tuning]
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Operational scenario
+      description: The concrete situation (hypothetical is fine) where current behaviour is wrong or missing.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+  - type: textarea
+    id: tests
+    attributes:
+      label: Resilience-test rows affected
+      description: From `skills/stag-techops-resilience-tests/SKILL.md` (e.g. rows 1, 4, 7).
+  - type: textarea
+    id: controls
+    attributes:
+      label: Which control stays explicit?
+      description: Identity, state transition, authorization, idempotency, verification, budget — what must remain outside the model?

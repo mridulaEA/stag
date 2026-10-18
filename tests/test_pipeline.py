@@ -1,10 +1,11 @@
 """Tests for the STAG pipeline components."""
 
 import pytest
+
+from stag.knowledge.graph_store import GraphStore
+from stag.knowledge.sparse_store import SparseStore
 from stag.models import StreamEvent
 from stag.models.schemas import EventType, Severity
-from stag.knowledge.sparse_store import SparseStore
-from stag.knowledge.graph_store import GraphStore
 
 
 def _make_event(**kwargs) -> StreamEvent:

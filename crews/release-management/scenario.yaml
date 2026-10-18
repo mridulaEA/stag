@@ -1,0 +1,26 @@
+name: canary-regression-and-hotfix
+description: A canary of orders-api regresses (policy-approvable, medium), while an emergency hotfix on billing-api raises a critical signal that needs the release manager.
+events:
+  - source: argo-cd
+    event_type: deployment
+    severity: low
+    payload: { stage: canary, version: v118, change_type: standard, canary_error_rate: 0.001 }
+    metadata: { service: orders-api, environment: production }
+  - repeat: 3
+    source: datadog
+    event_type: metric
+    severity: medium
+    payload: { stage: canary, version: v118, canary_error_rate: 0.019 }
+    metadata: { service: orders-api, environment: production }
+  - source: github-actions
+    event_type: deployment
+    severity: critical
+    payload: { stage: full, version: v7-hotfix, change_type: emergency, canary_error_rate: 0.0 }
+    metadata: { service: billing-api, environment: production }
+  - source: datadog
+    event_type: metric
+    severity: low
+    payload: { latency_delta_pct: 3 }
+    metadata: { service: search-api, environment: production }
+verification: { default: healthy }
+expect: { incidents: 2, resolved_with_auto_approve: 2, policy_approved_at_least: 1, held_without_auto_approve: 1, resolved_without_auto_approve: 1 }

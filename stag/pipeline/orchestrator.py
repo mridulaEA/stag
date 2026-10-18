@@ -15,9 +15,10 @@ import structlog
 
 from stag.config import Settings
 from stag.generation import InsightGenerator
-from stag.knowledge import HybridRetriever, VectorStore, GraphStore, SparseStore
-from stag.models import StreamEvent, PipelineOutput
+from stag.knowledge import HybridRetriever
+from stag.models import PipelineOutput, StreamEvent
 from stag.streams.base import StreamSource
+from stag.techops import IncidentCoordinator
 from stag.triggers import TriggerEngine
 
 logger = structlog.get_logger()
@@ -41,12 +42,16 @@ class PipelineOrchestrator:
         retriever: HybridRetriever,
         generator: InsightGenerator,
         settings: Settings,
+        coordinator: IncidentCoordinator | None = None,
     ) -> None:
         self.stream = stream_source
         self.triggers = trigger_engine
         self.retriever = retriever
         self.generator = generator
         self.settings = settings
+        # Optional TechOps coordinator: dedup + incident correlation + investigation cadence.
+        # When present, a fired trigger only reaches the LLM on a *material* incident change.
+        self.coordinator = coordinator
 
         self._running = False
         self._callbacks: list = []
@@ -55,6 +60,7 @@ class PipelineOrchestrator:
         self._event_count = 0
         self._trigger_count = 0
         self._insight_count = 0
+        self._suppressed_count = 0
 
     def on_output(self, callback) -> None:
         """Register a callback for pipeline outputs.
@@ -118,6 +124,33 @@ class PipelineOrchestrator:
 
         self._trigger_count += 1
 
+        # Step 2b (TechOps): coordinate before investigating. Duplicate deliveries and repeated
+        # symptoms update incident evidence without a model call.
+        decision = None
+        if self.coordinator is not None:
+            decision = self.coordinator.ingest(event, trigger)
+            if decision.duplicate or decision.conflicting or decision.investigation_request is None:
+                self._suppressed_count += 1
+                logger.info(
+                    "pipeline.investigation_suppressed",
+                    event_id=event.id,
+                    incident_id=decision.incident_id,
+                    reason=decision.reason,
+                )
+                for cb in self._callbacks:
+                    try:
+                        await cb(
+                            {
+                                "type": "incident_update",
+                                "event": event.model_dump(mode="json"),
+                                "trigger": trigger.model_dump(mode="json"),
+                                "decision": decision.model_dump(mode="json"),
+                            }
+                        )
+                    except Exception:
+                        pass
+                return
+
         # Step 3: Hybrid retrieval — build query from event and trigger
         query = self._build_retrieval_query(event, trigger)
         retrieval = await self.retriever.search(query, top_k=8)
@@ -134,6 +167,11 @@ class PipelineOrchestrator:
             retrieval=retrieval,
             insight=insight,
             pipeline_time_ms=elapsed,
+            incident_id=decision.incident_id if decision else None,
+            investigation_request_id=(
+                decision.investigation_request.id if decision and decision.investigation_request else None
+            ),
+            material_change=decision.material_change.value if decision else None,
         )
         self._recent_outputs.append(output)
 
@@ -194,7 +232,9 @@ class PipelineOrchestrator:
             "events_processed": self._event_count,
             "triggers_fired": self._trigger_count,
             "insights_generated": self._insight_count,
+            "investigations_suppressed": self._suppressed_count,
             "trigger_rate": self._trigger_count / max(1, self._event_count),
+            "techops": self.coordinator.stats if self.coordinator else None,
             "trigger_engine": self.triggers.stats,
             "retriever": self.retriever.stats,
             "generator": self.generator.stats,

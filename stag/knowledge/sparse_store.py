@@ -80,7 +80,7 @@ class SparseStore:
         doc_ids = list(self._documents.keys())
 
         # Get top-k by score
-        scored = sorted(zip(doc_ids, scores), key=lambda x: x[1], reverse=True)[:top_k]
+        scored = sorted(zip(doc_ids, scores, strict=True), key=lambda x: x[1], reverse=True)[:top_k]
 
         if not scored:
             return []

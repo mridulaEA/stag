@@ -1,0 +1,29 @@
+name: oom-burst-and-collector-lag
+description: An OutOfMemory signature repeats across instances while the collector falls behind; a medium burst is policy-approvable.
+events:
+  - id: log-oom-1
+    repeat: 3
+    source: otel-collector
+    event_type: log
+    severity: high
+    payload: { message: "java.lang.OutOfMemoryError: Java heap space", level: error, template_id: t-881, lines_per_minute: 1200 }
+    metadata: { service: recommendation-svc, environment: production }
+  - repeat: 5
+    source: otel-collector
+    event_type: log
+    severity: high
+    payload: { message: "OutOfMemoryError while allocating buffer", level: error, template_id: t-881, lines_per_minute: 1500 }
+    metadata: { service: recommendation-svc, environment: production }
+  - repeat: 2
+    source: otel-collector
+    event_type: metric
+    severity: medium
+    payload: { message: "collector queue growing", ingest_lag_seconds: 240, lines_per_minute: 9000 }
+    metadata: { service: otel-gateway, environment: production }
+  - source: loki
+    event_type: log
+    severity: low
+    payload: { message: "request completed", level: info, lines_per_minute: 300 }
+    metadata: { service: search-api, environment: production }
+verification: { default: healthy }
+expect: { incidents: 2, duplicate_deliveries: 2, resolved_with_auto_approve: 2, policy_approved_at_least: 1 }

@@ -1,0 +1,107 @@
+name: problem-management
+display_name: Problem Management Crew
+domain: techops
+version: 1.0.0
+purpose: >
+  Detect recurring incidents and known-error patterns across resolved episodes, open a problem
+  record, run evidence-grounded root-cause analysis, document a known error with a workaround, and
+  drive a permanent fix through change approval with verified recurrence checks.
+when_to_use: >
+  The same service keeps producing incidents, workarounds are applied repeatedly, or an ITIL-style
+  problem process must be fed from STAG incident history instead of manual ticket review.
+
+stream:
+  sources: [stag-incidents, servicenow, jira]
+  event_types: [alert, ticket]
+  notes: "feed resolved/recurring incident summaries as events; payload.category marks known errors"
+
+signal_key:
+  service: metadata.service
+  environment: metadata.environment
+
+triggers:
+  - type: frequency
+    name: recurring_incident
+    params: { window_seconds: 604800, max_events: 2, group_by: service }
+  - type: pattern
+    name: known_error_pattern
+    params: { field: category, pattern: "recurr|repeat|known.?error|workaround" }
+
+coordinator:
+  investigation_cooldown_seconds: 86400
+  recurrence_window_seconds: 2592000
+
+roles:
+  - id: problem_analyst
+    title: Problem analyst
+    agent: stag-problem-analyst
+    skills: [stag-problem-management, stag-techops-dedup-correlation]
+  - id: investigator
+    title: Root-cause investigator
+    agent: stag-investigator
+    skills: [stag-techops-bounded-investigation]
+    permissions:
+      capabilities: [read_incident_history, read_dependency_graph, inspect_deployment_metadata, read_metrics, retrieve_approved_runbooks]
+  - id: change_owner
+    title: Change owner / CAB (human)
+    human: true
+    skills: [stag-release-gate]
+  - id: verifier
+    title: Recurrence verifier
+    agent: stag-recovery-verifier
+    skills: [stag-techops-recovery-verification]
+
+workflow:
+  - step: coordinate
+    action: coordinate
+    role: problem_analyst
+  - step: open_problem
+    action: transition
+    to: triaged
+    role: problem_analyst
+    description: Problem record opened; linked incidents attached via external_refs.
+  - step: root_cause_analysis
+    action: investigate
+    role: investigator
+    assignment: { max_model_calls: 6, max_tool_calls: 12, max_runtime_seconds: 300, budget_profile: deep-analysis }
+  - step: known_error
+    action: record
+    artifact: known_error_record
+    role: problem_analyst
+    description: Known error + workaround, clearly labelled as draft until reviewed.
+  - step: propose_permanent_fix
+    action: propose_action
+    role: problem_analyst
+    plan_step: schedule_permanent_fix
+    target_from: metadata.service
+    parameters: { change_type: normal, requires_cab: true }
+    policy_version: change-policy@2026-Q4
+    preconditions: [root_cause_evidenced, workaround_documented]
+  - step: cab_approval
+    action: authorize
+    role: change_owner
+    policy: { mode: human, approver_role: change_owner }
+  - step: raise_change
+    action: dispatch
+    role: problem_analyst
+  - step: verify_no_recurrence
+    action: verify
+    role: verifier
+  - step: close_problem
+    action: transition
+    to: resolved
+    role: problem_analyst
+  - step: problem_review
+    action: record
+    artifact: problem_review
+    role: problem_analyst
+
+outputs: [Problem record linked to incident episodes, Known error record (draft), Permanent-fix change request, Recurrence verification]
+kpis:
+  - { name: recurrence_rate_after_fix, target: "0 within 30 days" }
+  - { name: incidents_linked_per_problem }
+  - { name: time_from_pattern_to_problem_record }
+guardrails:
+  - Similar symptoms are a clue, not proof of shared cause; each incident keeps its own record.
+  - Known-error content is a draft until reviewed; never auto-promoted to runbooks or the index.
+  - Changes go through the ledger with explicit CAB approval.

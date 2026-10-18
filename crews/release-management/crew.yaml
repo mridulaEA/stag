@@ -1,0 +1,111 @@
+name: release-management
+display_name: Release Management Crew
+domain: techops
+version: 1.0.0
+purpose: >
+  Gate releases with live evidence: check deployments against open incidents and change freezes,
+  watch canary health after rollout, propose a rollback as one retry-safe operation, and record the
+  release decision. Low-risk rollbacks may be policy-approved; anything above medium severity
+  waits for the release manager.
+when_to_use: >
+  CI/CD emits deployment events and post-deploy metrics into STAG, and the team wants canary
+  regressions and emergency changes handled consistently instead of by whoever is watching the chat.
+
+stream:
+  sources: [argo-cd, github-actions, datadog]
+  event_types: [deployment, metric, alert]
+  notes: "payload.stage (canary|full), payload.version, payload.change_type (standard|normal|emergency)"
+
+signal_key:
+  service: metadata.service
+  environment: metadata.environment
+
+triggers:
+  - type: numeric_threshold
+    name: canary_regression
+    params: { field: canary_error_rate, threshold: 0.005, op: gt }
+  - type: pattern
+    name: emergency_change
+    params: { field: change_type, pattern: "emergency|hotfix" }
+  - type: numeric_threshold
+    name: deploy_latency_regression
+    params: { field: latency_delta_pct, threshold: 25, op: gt }
+
+coordinator:
+  investigation_cooldown_seconds: 600
+
+roles:
+  - id: gatekeeper
+    title: Release gatekeeper
+    agent: stag-release-gatekeeper
+    skills: [stag-release-gate, stag-techops-dedup-correlation]
+    permissions:
+      capabilities: [read_incident_history, inspect_deployment_metadata, read_service_health, read_metrics, read_dependency_graph]
+  - id: remediation_reviewer
+    title: Rollback reviewer
+    agent: stag-remediation-reviewer
+    skills: [stag-techops-remediation-ledger]
+  - id: verifier
+    title: Canary / rollback verifier
+    agent: stag-recovery-verifier
+    skills: [stag-techops-recovery-verification]
+  - id: release_manager
+    title: Release manager (human)
+    human: true
+    skills: [stag-release-gate]
+
+workflow:
+  - step: coordinate
+    action: coordinate
+    role: gatekeeper
+  - step: gate_triage
+    action: transition
+    to: triaged
+    role: gatekeeper
+    description: Freeze window? open incidents on this service or its dependencies? canary vs full rollout?
+  - step: freeze_and_canary_check
+    action: investigate
+    role: gatekeeper
+    assignment: { max_model_calls: 3, max_tool_calls: 8, max_runtime_seconds: 90, budget_profile: release-gate }
+  - step: propose_rollback
+    action: propose_action
+    role: remediation_reviewer
+    plan_step: rollback_deployment
+    target_from: metadata.service
+    parameters: { to: previous_stable, scope: canary_first }
+    policy_version: release-policy@2026-Q4
+    preconditions: [canary_regression_confirmed, previous_version_available]
+  - step: authorize
+    action: authorize
+    role: release_manager
+    policy: { mode: policy, auto_if_severity_at_most: medium, approver_role: release_manager }
+    description: Policy may approve low/medium-severity canary rollbacks; high/critical waits for the release manager.
+  - step: dispatch
+    action: dispatch
+    role: remediation_reviewer
+  - step: verify
+    action: verify
+    role: verifier
+  - step: close
+    action: transition
+    to: resolved
+    role: gatekeeper
+  - step: release_note
+    action: record
+    artifact: release_decision
+    role: gatekeeper
+  - step: announce
+    action: notify
+    channel: release-channel
+    template: release_decision
+    role: gatekeeper
+
+outputs: [Release decision record per deployment signal, Rollback operations with approvals and verification, Freeze/incident conflicts surfaced before full rollout]
+kpis:
+  - { name: canary_regressions_caught_before_full_rollout }
+  - { name: rollback_time_to_verified, target: "< 15 min" }
+  - { name: policy_vs_human_approvals }
+guardrails:
+  - A code rollback is not a business rollback; compensating actions are separate ledger operations.
+  - Policy approval is bounded by severity; the agent cannot relabel severity.
+  - Release decisions are recorded with the evidence that justified them.

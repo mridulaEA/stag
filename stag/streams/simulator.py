@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import random
-from datetime import datetime
 
 import structlog
 

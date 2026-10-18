@@ -1,0 +1,28 @@
+name: engineering-source-code-to-chatgpt
+description: Several engineers paste source code into ChatGPT (unsanctioned) within an hour; one DLP event is redelivered; a sanctioned Copilot use is benign.
+events:
+  - id: dlp-7781
+    repeat: 2
+    source: dlp
+    event_type: data_transfer
+    severity: high
+    payload: { tool: ChatGPT, user: alex.chen@corp.example.com, department: Engineering, data_type: source_code, sanctioned: false, data_size_kb: 820 }
+    metadata: { scenario: data_exposure }
+  - repeat: 3
+    source: dlp
+    event_type: tool_usage
+    severity: high
+    payload: { tool: ChatGPT, user: jordan.patel@corp.example.com, department: Engineering, data_type: source_code, sanctioned: false, data_size_kb: 240 }
+    metadata: { scenario: shadow_ai }
+  - source: secure-web-gateway
+    event_type: data_transfer
+    severity: critical
+    payload: { tool: ChatGPT, user: sam.kim@corp.example.com, department: Engineering, data_type: api_keys, sanctioned: false, data_size_kb: 12 }
+    metadata: { scenario: data_exposure }
+  - source: casb
+    event_type: tool_usage
+    severity: low
+    payload: { tool: "Microsoft Copilot", user: riley.lee@corp.example.com, department: Marketing, data_type: marketing_copy, sanctioned: true, data_size_kb: 40 }
+    metadata: { scenario: normal_usage }
+verification: { default: healthy }
+expect: { incidents_at_least: 1, duplicate_deliveries: 1, resolved_with_auto_approve_at_least: 1, held_without_auto_approve_at_least: 1 }

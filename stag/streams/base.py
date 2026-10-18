@@ -49,7 +49,7 @@ class StreamSource(ABC):
             try:
                 event = await asyncio.wait_for(self._queue.get(), timeout=1.0)
                 yield event
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
     @property

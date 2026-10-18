@@ -26,6 +26,16 @@ class EventType(str, Enum):
     AUTHENTICATION = "authentication"
     DATA_TRANSFER = "data_transfer"
     CONFIGURATION_CHANGE = "configuration_change"
+    # Operational streams used by crews
+    LOG = "log"
+    METRIC = "metric"
+    ALERT = "alert"
+    DEPLOYMENT = "deployment"
+    TICKET = "ticket"
+    CUSTOMER_FEEDBACK = "customer_feedback"
+    PIPELINE_RUN = "pipeline_run"
+    DATA_QUALITY = "data_quality"
+    AUTOMATION_RUN = "automation_run"
 
 
 class TriggerType(str, Enum):
@@ -127,3 +137,6 @@ class PipelineOutput(BaseModel):
     retrieval: RetrievalResult
     insight: GeneratedInsight
     pipeline_time_ms: float = 0.0
+    incident_id: str | None = None
+    investigation_request_id: str | None = None
+    material_change: str | None = None

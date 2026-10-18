@@ -6,7 +6,9 @@ STAG is an open-source framework that flips traditional RAG on its head. Instead
 
 Named after the concept of **Stream-Triggered Augmented Generation** — where the stream triggers the AI, not the user.
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python) ![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green?logo=fastapi) ![React](https://img.shields.io/badge/React-18.3-blue?logo=react) ![License](https://img.shields.io/badge/License-MIT-green)
+![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python) ![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green?logo=fastapi) ![React](https://img.shields.io/badge/React-18.3-blue?logo=react) ![License](https://img.shields.io/badge/License-MIT-green) ![Skills](https://img.shields.io/badge/Agent%20Skills-Claude%20Code%20%7C%20Codex%20%7C%20Cursor-purple)
+
+> **New in 0.3:** a [TechOps backbone](#techops-deterministic-backbone-bounded-agents) (dedup, incident lifecycle, bounded investigation, retry-safe actions), a [skill pack](#agent-skills-claude-code-codex-cursor) that works in Claude Code, Codex and Cursor, and eight ready-made [crews](#crews-ready-made-teams-per-use-case) (incident triage, problem management, release management, AI automation, customer care, log management, data ops, security governance) that run end-to-end. Start with [`crews/README.md`](crews/README.md).
 
 ---
 
@@ -92,6 +94,7 @@ Traditional Retrieval-Augmented Generation is **reactive** — it sits idle unti
 1. **Stream** — Events flow in from Kafka, webhooks, or the built-in simulator
 2. **Index** — Every event is indexed across all three knowledge stores simultaneously
 3. **Trigger** — Rules evaluate each event (severity, patterns, sensitive data, frequency, volume)
+3b. **Coordinate** *(optional, TechOps)* — Duplicate deliveries are counted, repeated symptoms update the open incident, and only a *material change* creates an investigation request
 4. **Retrieve** — When a trigger fires, hybrid retrieval pulls relevant context from vector (semantic), graph (relational), and sparse (keyword) stores
 5. **Fuse** — Reciprocal Rank Fusion (RRF) merges results from all three retrieval paths
 6. **Generate** — LLM produces a structured insight with title, analysis, severity, and recommendations
@@ -116,6 +119,15 @@ Traditional Retrieval-Augmented Generation is **reactive** — it sits idle unti
   - **Data Volume** — Fires on large data transfers
 - **Composable rules**: Register custom rules via `RuleRegistry`
 - **Best-match selection**: Returns highest-confidence trigger when multiple rules fire
+
+### TechOps Backbone (deterministic, bounded agents)
+- **Four identities kept separate**: observation (tenant+source+event_id), signal grouping key, incident episode, action operation
+- **Incident lifecycle state machine**: `DETECTED → … → VERIFYING → RESOLVED`; every transition recorded with actor, reason and version; an agent message never changes state
+- **Coordinator**: redelivery counted without inflating evidence, conflicting payloads quarantined, repeated symptoms attached to the right episode, investigation only on material change (new incident, severity increase, new signature, recurrence, cooldown)
+- **Assignment contract**: YAML scope / capabilities / limits / required output enforced by `BoundedRun` outside the model
+- **Action ledger**: deterministic operation ids, authorize → revalidate → dispatch, `OUTCOME_UNKNOWN → RECONCILING`, independent verification
+- **Budget ledger**: reserve before dispatch, settle afterward
+- **REST**: `/api/techops/incidents`, `/api/techops/investigations`, `/api/techops/actions`
 
 ### Hybrid Knowledge Store
 - **Vector Store (ChromaDB)**: Semantic similarity search with sentence-transformer embeddings
@@ -228,8 +240,17 @@ stag/
 │   ├── generation/                # LLM generation
 │   │   ├── generator.py          # Multi-provider insight generator
 │   │   └── prompts.py            # System and insight prompt templates
+│   ├── techops/                   # Deterministic TechOps backbone
+│   │   ├── identity.py           # Observation / signal / incident / action identity
+│   │   ├── incident.py           # Incident lifecycle state machine
+│   │   ├── coordinator.py        # Dedup, correlation, material-change gating
+│   │   ├── assignment.py         # Bounded investigation contract + enforcement
+│   │   ├── actions.py            # Retry-safe action ledger
+│   │   └── budget.py             # Reserve/settle admission control
+│   ├── skills/                    # `stag-skills` CLI (list / validate / install)
+│   ├── crews/                     # Crew schema, loader, runner (`stag-crews` CLI)
 │   ├── pipeline/                  # Pipeline orchestration
-│   │   └── orchestrator.py       # Stream → Trigger → Retrieve → Generate
+│   │   └── orchestrator.py       # Stream → Trigger → (Coordinate) → Retrieve → Generate
 │   ├── api/                       # FastAPI layer
 │   │   ├── routes.py             # REST + WebSocket endpoints
 │   │   └── websocket.py          # Connection manager
@@ -243,9 +264,25 @@ stag/
 │   │   └── hooks/useWebSocket.js # WebSocket connection hook
 │   ├── package.json
 │   └── vite.config.js            # Dev proxy to backend
+├── crews/                         # Ready-made teams: crew.yaml + scenario.yaml + README per use case
+├── skills/                        # Agent skill pack (Claude Code / Codex / Cursor)
+│   ├── stag-techops-*/SKILL.md   # TechOps workflows
+│   ├── stag-{problem-management,release-gate,ai-automation-governance,customer-care-comms,
+│   │        log-analysis,dataops-pipeline-triage,security-governance}/   # per-crew workflows
+│   ├── stag-multi-agent-orchestration/, stag-crew-authoring/
+│   └── stag-*/                   # development skills
+├── agents/                        # Claude Code subagents (11 roles)
+├── .claude-plugin/                # plugin.json + marketplace.json (install from anywhere)
+├── .claude/skills, .agents/skills # → ../skills (project discovery for Claude Code, Codex, Cursor)
+├── AGENTS.md, CLAUDE.md, .cursor/rules/   # agent guidance per runtime
+├── docs/techops/                  # TechOps design summary
+├── docs/community/                # Developer community guide
 ├── tests/                         # Test suite
 │   ├── test_triggers.py          # Trigger rule tests
-│   └── test_pipeline.py          # Pipeline component tests
+│   ├── test_pipeline.py          # Pipeline component tests
+│   ├── test_techops.py           # Backbone: dedup, lifecycle, contracts, ledger, budget
+│   ├── test_techops_api.py       # /api/techops endpoints
+│   └── test_skills.py            # Skill pack validation + installer
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
@@ -283,6 +320,12 @@ All configuration is via environment variables (or `.env` file):
 | **Generation** | | |
 | `GENERATION_MAX_TOKENS` | `1024` | Max tokens for LLM generation |
 | `GENERATION_TEMPERATURE` | `0.3` | LLM temperature |
+| **TechOps** | | |
+| `TECHOPS_COORDINATOR_ENABLED` | `false` | Gate the LLM path behind dedup + incident correlation |
+| `TECHOPS_TENANT` | `default` | Tenant scope enforced on every identity |
+| `TECHOPS_INVESTIGATION_COOLDOWN_SECONDS` | `300` | Minimum gap between routine re-investigations (severity increase / new signature bypass it) |
+| `TECHOPS_RECURRENCE_WINDOW_SECONDS` | `3600` | Signal returning within this window after RESOLVED is flagged as recurrence |
+| `TECHOPS_DEDUP_RETENTION` | `50000` | Observation identities kept for duplicate detection (size to your replay horizon) |
 | **Simulator** | | |
 | `SIMULATOR_INTERVAL` | `3.0` | Seconds between simulated events |
 | `SIMULATOR_SCENARIO` | `enterprise_ai` | Simulation scenario |
@@ -308,6 +351,21 @@ All configuration is via environment variables (or `.env` file):
 | `GET` | `/api/knowledge/graph/stats` | Knowledge graph statistics |
 | `POST` | `/api/pipeline/start` | Start the pipeline |
 | `POST` | `/api/pipeline/stop` | Stop the pipeline |
+| `GET` | `/api/crews` | Crew catalog (roles, skills, workflow, KPIs) |
+| `GET` | `/api/crews/{name}` | One crew with its bundled scenario |
+| `POST` | `/api/crews/{name}/run` | Dry-run a crew `{auto_approve, scenario?}` on an isolated coordinator/ledger |
+| `GET` | `/api/techops/incidents?open_only=true` | Incident episodes with dedup / correlation stats |
+| `GET` | `/api/techops/incidents/{id}` | One incident with history and its actions |
+| `POST` | `/api/techops/incidents/{id}/transition` | Explicit lifecycle transition `{to, actor, reason}` |
+| `POST` | `/api/techops/incidents/{id}/external` | Map to an external ticket / incident id |
+| `GET` | `/api/techops/investigations` | Investigation requests (material changes) |
+| `GET` | `/api/techops/actions` | Action ledger |
+| `POST` | `/api/techops/actions/prepare` | Prepare a remediation operation (deterministic id) |
+| `POST` | `/api/techops/actions/{op}/authorize` | Bind an approval to target + incident version |
+| `POST` | `/api/techops/actions/{op}/dispatch?current_incident_version=` | Revalidate staleness, then dispatch |
+| `POST` | `/api/techops/actions/{op}/outcome-unknown` | Lost response → reconciling |
+| `POST` | `/api/techops/actions/{op}/reconcile?target_state_observed=` | Resolve from the target's state |
+| `POST` | `/api/techops/actions/{op}/verify` | Record independent recovery verification |
 
 ### WebSocket
 
@@ -318,7 +376,11 @@ Connect to `ws://localhost:8000/api/ws` for real-time streaming:
 {"type": "event", "event": {...}}
 
 // Insight (trigger fired → retrieval → generation)
-{"type": "insight", "output": {"event": {...}, "trigger": {...}, "retrieval": {...}, "insight": {...}}}
+{"type": "insight", "output": {"event": {...}, "trigger": {...}, "retrieval": {...}, "insight": {...},
+                               "incident_id": "INC-…", "investigation_request_id": "INV-…", "material_change": "new_incident"}}
+
+// Incident update (TechOps coordinator enabled; trigger fired but no material change → no LLM call)
+{"type": "incident_update", "event": {...}, "trigger": {...}, "decision": {"incident_id": "INC-…", "duplicate": false, "material_change": "none", ...}}
 ```
 
 ---
@@ -343,6 +405,107 @@ When a trigger fires (e.g., "source code sent to ChatGPT by Engineering"), the p
 - **Generates** an insight with analysis, severity assessment, and recommendations
 
 ---
+
+## TechOps: deterministic backbone, bounded agents
+
+STAG 0.2 adds the controls from the *STAG in Production* and *Enterprise STAG* articles so that
+**continuous monitoring does not require continuous LLM calls** and investigations never act twice.
+
+```text
+event + trigger ──► IncidentCoordinator.ingest
+   ├─ redelivery (same identity, same payload)  → count only
+   ├─ conflict   (same identity, other payload) → quarantine
+   ├─ repeated symptom on open incident          → attach evidence, bump version, no model call
+   └─ material change                            → InvestigationRequest ──► bounded investigation
+                                                                              │ (assignment contract)
+                                                   ActionLedger.prepare ◄─── proposal
+                                                   authorize → revalidate → dispatch → verify
+```
+
+```bash
+TECHOPS_COORDINATOR_ENABLED=true python -m stag.main
+curl localhost:8000/api/techops/incidents | jq '.stats'
+```
+
+Programmatic use:
+
+```python
+from stag.techops import IncidentCoordinator, InvestigationAssignment, ActionLedger
+
+coord = IncidentCoordinator(tenant="acme")
+decision = coord.ingest(event, trigger)          # .duplicate / .material_change / .investigation_request
+
+assignment = InvestigationAssignment.from_yaml(open("assignment.yaml").read())
+run = assignment.start()
+run.use_capability("query_scoped_logs", service="checkout-api")   # PermissionDenied if not allowed
+findings = run.finish(my_findings)               # partial + escalate when limits/evidence fall short
+
+ledger = ActionLedger()
+op = ledger.prepare(decision.incident_id, "restart_component", "checkout-api", {"replicas": 2})
+ledger.authorize(op.operation_id, actor="oncall@acme", incident_version=coord.get_incident(op.incident_id).version)
+ledger.dispatch(op.operation_id)                 # retries reuse op.operation_id
+```
+
+Design summary: [`docs/techops/README.md`](docs/techops/README.md). Tests mirroring the
+failure-scenario matrix: [`tests/test_techops.py`](tests/test_techops.py).
+
+## Crews: ready-made teams per use case
+
+A crew is roles (agents + skills + least permissions, with a **human approver**) plus a workflow
+written only in backbone operations, plus a scenario that proves it runs end-to-end — offline,
+with a deterministic executor, no API key needed.
+
+| Crew | Watches | Human gate |
+|---|---|---|
+| `techops-incident-triage` | error rate, latency, error signatures, alerts | on-call approves restart / rollback |
+| `problem-management` | recurring incidents, known-error tickets | change owner / CAB approves permanent fix |
+| `release-management` | canary regressions, emergency changes | policy ≤ medium, else release manager |
+| `ai-automation` | automation failure spikes, unknown outcomes, retry storms, cost | policy ≤ medium, else platform owner |
+| `customer-care` | ticket surges, CSAT drops, blocked journeys | care lead approves known-issue response |
+| `log-management` | error signatures, log bursts, collector lag | policy ≤ medium, else platform on-call |
+| `data-ops` | pipeline failures, quality drift, freshness SLA | dataset owner approves backfill |
+| `security-governance` | sensitive data to unsanctioned AI tools (STAG defaults) | CISO delegate approves DLP control |
+
+```bash
+python -m stag.crews list
+python -m stag.crews run techops-incident-triage                  # halts at the human gate → HELD
+python -m stag.crews run techops-incident-triage --auto-approve   # simulate the approver → RESOLVED
+python -m stag.crews run-all --auto-approve                       # check every crew end-to-end
+```
+
+Every crew run reports **model calls avoided** (duplicates + evidence-only updates), incidents
+resolved vs held, operations with approvals and verification, notifications with provenance and
+draft artifacts. The dashboard's **Crews** tab shows the catalog and runs dry runs; the API exposes
+`GET /api/crews` and `POST /api/crews/{name}/run`. Author your own with the `stag-crew-authoring`
+skill — see [`crews/README.md`](crews/README.md) and [`docs/crews/README.md`](docs/crews/README.md).
+
+## Agent skills (Claude Code, Codex, Cursor)
+
+Twenty-one skills in the open Agent Skills format live in [`skills/`](skills/) and are discovered
+automatically in this repo by Claude Code (`.claude/skills`), Codex and Cursor (`.agents/skills`).
+Use them from any other project or machine:
+
+```bash
+# Claude Code plugin (skills + 4 subagents)
+claude plugin marketplace add mridulaEA/stag
+claude plugin install stag-techops@stag-skills
+
+# Claude Code / Codex / Cursor user-level skills, from a clone ...
+python -m stag.skills install --target all        # or --target claude|codex|cursor
+
+# ... or without cloning
+curl -fsSL https://raw.githubusercontent.com/mridulaEA/stag/main/scripts/install-skills.sh | bash
+```
+
+| Group | Skills |
+|---|---|
+| TechOps incident workflow | triage · dedup/correlation · bounded investigation · remediation ledger · recovery verification · postmortem |
+| TechOps platform | signal tuning · resilience tests · enterprise onboarding |
+| Use-case workflows | problem management · release gate · AI automation governance · customer care comms · log analysis · DataOps pipeline triage · security governance |
+| Multi-agent & crews | `stag-multi-agent-orchestration`, `stag-crew-authoring` + 11 Claude Code subagents in [`agents/`](agents/) |
+| Development | trigger rule authoring · stream adapter · skill authoring |
+
+Full catalog and invocation per tool: [`skills/README.md`](skills/README.md).
 
 ## Extending STAG
 
@@ -411,13 +574,22 @@ For production, swap in real infrastructure:
 - [Stream-Triggered RAG: How Proactive AI Monitors Data Streams](https://enterpriseaitech.com/blog/stream-triggered-rag) — The foundational article introducing STAG
 - [Stream-Triggered Hybrid GraphRAG](https://enterpriseaitech.com/blog/stream-triggered-hybrid-graphrag) — Deep dive into combining streaming, knowledge graphs, and hybrid retrieval
 - [Shadow AI Governance](https://enterpriseaitech.com/blog/shadow-ai-governance) — Enterprise AI governance framework (the demo scenario context)
+- *STAG in Production: When One Failure Becomes a Thousand AI Triggers* and *Enterprise STAG: Deterministic Operations, Bounded Agentic Investigation* — the TechOps articles behind `stag/techops/` and the skill pack (summary in [`docs/techops/README.md`](docs/techops/README.md))
 
 ---
 
-## Contributing
+## Community & Contributing
 
-Contributions are welcome. Areas where help is needed:
+- Start here: [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`docs/community/README.md`](docs/community/README.md) · [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+- Propose a skill with the *Skill proposal* issue template; propose backbone changes with *TechOps workflow change*.
+- Agent-friendly repo: `AGENTS.md`, `CLAUDE.md`, `.cursor/rules/` and the skill pack mean Codex, Claude Code and Cursor follow the project's conventions out of the box.
 
+Areas where help is needed:
+
+- [ ] Persistence for incidents and the action ledger (PostgreSQL / Redis) with an outbox dispatcher
+- [ ] PagerDuty / Jira / ServiceNow record mapping with verified dedup semantics
+- [ ] Labelled incident replay set for false-merge / false-split metrics
+- [ ] More skills: on-call handoff, change-freeze review, knowledge curation (see `docs/community`)
 - [ ] Production Kafka/Kinesis connectors with exactly-once semantics
 - [ ] Neo4j graph store adapter
 - [ ] Qdrant/Weaviate vector store adapters

@@ -1,0 +1,36 @@
+# Bounded investigation assignment — illustrative contract.
+# The executor (stag.techops.BoundedRun) enforces this; the prompt does not.
+# Numeric limits are examples to test, not universal thresholds.
+task: investigate_incident
+scope:
+  incident_id: INC-4821
+  service_ids: [checkout-api, identity-adapter]
+  environment: production
+  evidence_snapshot: incident-evidence-v17
+
+permissions:
+  capabilities:
+    - query_scoped_logs
+    - read_service_health
+    - retrieve_approved_runbooks
+    - inspect_deployment_metadata
+    - read_metrics
+    - read_traces
+    - read_incident_history
+    - read_dependency_graph
+  production_mutations: false
+
+limits:
+  max_model_calls: 4
+  max_tool_calls: 8
+  max_runtime_seconds: 120
+  budget_profile: standard-investigation
+
+output:
+  required:
+    - observed_facts_with_references
+    - hypotheses
+    - contradictory_or_missing_evidence
+    - proposed_next_step
+
+on_limit_or_uncertainty: return_partial_findings_and_escalate
