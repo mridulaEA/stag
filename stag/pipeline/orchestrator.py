@@ -16,7 +16,7 @@ import structlog
 from stag.config import Settings
 from stag.generation import InsightGenerator
 from stag.knowledge import HybridRetriever
-from stag.models import PipelineOutput, StreamEvent
+from stag.models import GeneratedInsight, PipelineOutput, RetrievalResult, StreamEvent
 from stag.streams.base import StreamSource
 from stag.techops import IncidentCoordinator
 from stag.triggers import TriggerEngine
@@ -54,6 +54,8 @@ class PipelineOrchestrator:
         self.coordinator = coordinator
 
         self._running = False
+        self._task: asyncio.Task | None = None
+        self._lifecycle_lock = asyncio.Lock()
         self._callbacks: list = []
         self._recent_events: deque[StreamEvent] = deque(maxlen=100)
         self._recent_outputs: deque[PipelineOutput] = deque(maxlen=50)
@@ -76,19 +78,34 @@ class PipelineOrchestrator:
         logger.info("pipeline.initialized")
 
     async def start(self) -> None:
-        """Start the pipeline: connect to stream and begin processing."""
-        self._running = True
-        await self.stream.start()
-        logger.info("pipeline.started", stream=type(self.stream).__name__)
-
-        asyncio.create_task(self._process_loop())
+        """Start the pipeline (idempotent): connect to the stream and own the processing task."""
+        async with self._lifecycle_lock:
+            if self._running and self._task is not None and not self._task.done():
+                return
+            self._running = True
+            await self.stream.start()
+            self._task = asyncio.create_task(self._process_loop(), name="stag-pipeline")
+            logger.info("pipeline.started", stream=type(self.stream).__name__)
 
     async def stop(self) -> None:
-        """Stop the pipeline and disconnect from the stream."""
-        self._running = False
-        await self.stream.stop()
-        await self.retriever.graph_store.persist()
-        logger.info("pipeline.stopped", events=self._event_count, insights=self._insight_count)
+        """Stop the pipeline (idempotent): cancel and await the processing task, then persist."""
+        async with self._lifecycle_lock:
+            if not self._running and self._task is None:
+                return
+            self._running = False
+            await self.stream.stop()
+            task, self._task = self._task, None
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            try:
+                await self.retriever.graph_store.persist()
+            except Exception as e:  # persistence failure must not mask the stop
+                logger.error("pipeline.persist_error", error=str(e))
+            logger.info("pipeline.stopped", events=self._event_count, insights=self._insight_count)
 
     async def _process_loop(self) -> None:
         """Main processing loop: consume events and run pipeline."""
@@ -100,63 +117,125 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.error("pipeline.event_error", event_id=event.id, error=str(e))
 
+    async def _emit(self, message: dict) -> None:
+        for cb in self._callbacks:
+            try:
+                await cb(message)
+            except Exception as e:
+                logger.error("pipeline.callback_error", error=str(e))
+
     async def _process_event(self, event: StreamEvent) -> None:
-        """Process a single event through the full pipeline."""
+        """Process a single event.
+
+        Order matters:
+          1. identity (dedup) — before any stateful effect
+          2. index + deterministic trigger evaluation
+          3. emit the deterministic detection *before* optional enrichment
+          4. coordinate (material change?) → retrieval → generation, each failure-isolated
+        """
         start = time.time()
         self._event_count += 1
         self._recent_events.append(event)
 
-        # Step 1: Index event into knowledge stores
-        await self.retriever.add_event(event)
+        # Step 0 (TechOps): register identity first. Duplicates and conflicts are never indexed and
+        # never reach stateful trigger rules, so they cannot inflate frequency counts or graph weights.
+        registration = None
+        if self.coordinator is not None:
+            registration = self.coordinator.register(event)
+            if not registration.accepted:
+                self._suppressed_count += 1
+                await self._emit(
+                    {
+                        "type": "incident_update",
+                        "event": event.model_dump(mode="json"),
+                        "trigger": None,
+                        "decision": {
+                            "accepted": False,
+                            "duplicate": registration.duplicate,
+                            "conflicting": registration.conflicting,
+                            "incident_id": registration.prior_incident_id,
+                            "reason": registration.reason,
+                        },
+                    }
+                )
+                return
 
-        # Step 2: Evaluate triggers
+        # Step 1: Index event into knowledge stores (accepted observations only)
+        try:
+            await self.retriever.add_event(event)
+        except Exception as e:  # indexing is enrichment; it must not block detection
+            logger.error("pipeline.index_error", event_id=event.id, error=str(e))
+
+        # Step 2: Evaluate deterministic triggers
         trigger = self.triggers.evaluate(event)
 
         if trigger is None:
             logger.debug("pipeline.no_trigger", event_id=event.id)
-            # Broadcast event-only update (no insight)
-            for cb in self._callbacks:
-                try:
-                    await cb({"type": "event", "event": event.model_dump(mode="json")})
-                except Exception:
-                    pass
+            if self.coordinator is not None:
+                self.coordinator.correlate(event, None, registration)
+            await self._emit({"type": "event", "event": event.model_dump(mode="json")})
             return
 
         self._trigger_count += 1
 
-        # Step 2b (TechOps): coordinate before investigating. Duplicate deliveries and repeated
-        # symptoms update incident evidence without a model call.
+        # Step 2b (TechOps): correlate before investigating. Repeated symptoms update incident
+        # evidence; replay events and non-material changes never reach the LLM path.
         decision = None
         if self.coordinator is not None:
-            decision = self.coordinator.ingest(event, trigger)
-            if decision.duplicate or decision.conflicting or decision.investigation_request is None:
-                self._suppressed_count += 1
-                logger.info(
-                    "pipeline.investigation_suppressed",
-                    event_id=event.id,
-                    incident_id=decision.incident_id,
-                    reason=decision.reason,
-                )
-                for cb in self._callbacks:
-                    try:
-                        await cb(
-                            {
-                                "type": "incident_update",
-                                "event": event.model_dump(mode="json"),
-                                "trigger": trigger.model_dump(mode="json"),
-                                "decision": decision.model_dump(mode="json"),
-                            }
-                        )
-                    except Exception:
-                        pass
-                return
+            decision = self.coordinator.correlate(event, trigger, registration)
 
-        # Step 3: Hybrid retrieval — build query from event and trigger
+        # Step 3: emit the deterministic detection *now*, independent of retrieval/generation.
+        await self._emit(
+            {
+                "type": "trigger",
+                "event": event.model_dump(mode="json"),
+                "trigger": trigger.model_dump(mode="json"),
+                "decision": decision.model_dump(mode="json") if decision else None,
+            }
+        )
+
+        if decision is not None and decision.investigation_request is None:
+            self._suppressed_count += 1
+            logger.info(
+                "pipeline.investigation_suppressed",
+                event_id=event.id,
+                incident_id=decision.incident_id,
+                reason=decision.reason,
+            )
+            await self._emit(
+                {
+                    "type": "incident_update",
+                    "event": event.model_dump(mode="json"),
+                    "trigger": trigger.model_dump(mode="json"),
+                    "decision": decision.model_dump(mode="json"),
+                }
+            )
+            return
+
+        # Step 4: Hybrid retrieval — enrichment; failure degrades, never suppresses the detection
         query = self._build_retrieval_query(event, trigger)
-        retrieval = await self.retriever.search(query, top_k=8)
+        try:
+            retrieval = await self.retriever.search(query, top_k=8)
+        except Exception as e:
+            logger.error("pipeline.retrieval_error", event_id=event.id, error=str(e))
+            retrieval = RetrievalResult(query=query)
 
-        # Step 4: Generate insight
-        insight = await self.generator.generate(event, trigger, retrieval)
+        # Step 5: Generate insight (validated; degraded fallback on provider/schema failure)
+        try:
+            insight = await self.generator.generate(event, trigger, retrieval)
+        except Exception as e:
+            logger.error("pipeline.generation_error", event_id=event.id, error=str(e))
+            insight = GeneratedInsight(
+                trigger_id=trigger.trigger_id,
+                event_id=event.id,
+                title=f"Alert: {trigger.rule_name}",
+                summary=trigger.reason,
+                detail="Generation failed; deterministic detection preserved.",
+                severity=event.severity,
+                confidence=trigger.confidence,
+                generation_mode="degraded",
+                degraded_reason=str(e)[:200],
+            )
         self._insight_count += 1
 
         elapsed = (time.time() - start) * 1000
@@ -181,21 +260,29 @@ class PipelineOrchestrator:
             trigger=trigger.rule_name,
             severity=insight.severity.value,
             confidence=insight.confidence,
+            generation_mode=insight.generation_mode,
             pipeline_ms=round(elapsed, 1),
         )
-
-        # Broadcast output
-        for cb in self._callbacks:
-            try:
-                await cb({"type": "insight", "output": output.model_dump(mode="json")})
-            except Exception as e:
-                logger.error("pipeline.callback_error", error=str(e))
+        await self._emit({"type": "insight", "output": output.model_dump(mode="json")})
 
     @staticmethod
     def _build_retrieval_query(event: StreamEvent, trigger) -> str:
-        """Build a search query from the event and trigger context."""
+        """Build a search query from the event and trigger context.
+
+        Keeps exact operational identifiers (service, message, error code, deployment) alongside the
+        enterprise-AI demo fields so sparse retrieval can match them.
+        """
         parts = []
         payload = event.payload
+        meta = event.metadata or {}
+
+        for key in ("service", "dataset", "automation_id", "product_area"):
+            value = meta.get(key) or payload.get(key)
+            if value:
+                parts.append(str(value))
+        for key in ("message", "error_code", "template_id", "version", "status", "summary"):
+            if payload.get(key):
+                parts.append(str(payload[key])[:200])
 
         if payload.get("tool"):
             parts.append(payload["tool"])

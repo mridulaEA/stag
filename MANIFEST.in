@@ -1,0 +1,5 @@
+graft skills
+graft crews
+graft agents
+include README.md LICENSE .env.example
+global-exclude __pycache__ *.py[cod] .DS_Store

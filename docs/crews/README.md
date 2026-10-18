@@ -42,13 +42,18 @@ report = run_crew(crew, load_scenario(crew), auto_approve=False, executor=MyExec
 print(report.to_markdown())
 ```
 
-## Production shape
+## Simulation vs production
 
-In production the runner is driven by the live pipeline: the orchestrator's coordinator decision
-replaces `run_scenario`, humans approve through `POST /api/techops/actions/{op}/authorize`, and a
-durable workflow engine can host `run_workflow` per incident (LLM calls, DB and external APIs in
-activities with their own retries). The API's `POST /api/crews/{name}/run` is a dry run on an
-isolated coordinator and ledger for demos, tests and onboarding.
+Everything the runner does today is a **simulation** (`CrewRunReport.mode == "simulation"`):
+verdicts come from scenario fixtures labelled `simulated: true`, actions change ledger records
+only, approvals are flags, and a held run cannot be resumed through the live API (each API run
+uses its own isolated coordinator and ledger). The eight crews are scenario templates.
+
+A production runtime needs, in order: authenticated principals and resource authorization; a
+transactional store for observations, incidents, requests and operations with an outbox; a durable
+investigation and run lifecycle with resumable steps; a trusted tool/model gateway; destination
+adapters with live preconditions and reconciliation; independent recovery probes. See
+`docs/review/FINDINGS.md` (phases 1–3). Until then, do not connect real remediation tools.
 
 ## Mapping to Claude Code, Codex, Cursor
 

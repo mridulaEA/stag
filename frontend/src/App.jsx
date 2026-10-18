@@ -105,7 +105,9 @@ function EventRow({ event }) {
       <div className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: SEVERITY_COLORS[event.severity] }} />
       <span className="text-gray-500 text-xs w-16 shrink-0">{new Date(event.timestamp).toLocaleTimeString()}</span>
       <SeverityBadge severity={event.severity} />
-      <span className="text-gray-300 truncate flex-1">{payload.description || event.source}</span>
+      <span className="text-gray-300 truncate flex-1">{payload.description || payload.message || event.source}</span>
+      {event._trigger && <span className="text-xs text-yellow-500">⚡ {event._trigger}</span>}
+      {event._suppressed && <span className="text-xs text-gray-500" title={event._suppressed}>deduped</span>}
       <span className="text-xs text-gray-600">{event.event_type}</span>
     </div>
   )
@@ -240,8 +242,9 @@ function CrewCard({ crew }) {
 }
 
 export default function App() {
-  const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:8000/api/ws`
-  const { connected, events, insights } = useWebSocket(wsUrl)
+  // Same-origin WebSocket: works behind HTTPS/reverse proxies and the Vite dev proxy alike.
+  const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws`
+  const { connected, events, insights, incidentUpdates, lastError } = useWebSocket(wsUrl)
   const [stats, setStats] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState(null)
@@ -305,7 +308,7 @@ export default function App() {
               <Layers size={18} className="text-white" />
             </div>
             <div>
-              <h1 className="text-lg font-bold tracking-tight">STAG</h1>
+              <h1 className="text-lg font-bold tracking-tight">STAG {lastError && <span className="text-xs text-red-400 font-normal ml-2">{lastError}</span>}</h1>
               <p className="text-xs text-gray-500">Stream-Triggered Augmented Generation</p>
             </div>
           </div>
@@ -463,8 +466,10 @@ export default function App() {
           {activeTab === 'crews' ? (
             <div className="space-y-3">
               <p className="text-xs text-gray-500">
+                <span className="px-1.5 py-0.5 rounded border border-orange-500/40 text-orange-300 mr-2">SIMULATION</span>
                 Ready-made teams (roles + skills + workflow) that run on the TechOps backbone. Dry runs use the bundled
-                scenario on an isolated coordinator and ledger; they never touch live pipeline state.
+                scenario with fixture verdicts on an isolated coordinator and ledger; approvals are simulated flags and
+                no action reaches a real destination.
               </p>
               {crews.length === 0 ? (
                 <div className="text-center py-12 text-gray-600">
@@ -506,7 +511,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-gray-800 mt-12 py-4 text-center text-xs text-gray-600">
-        STAG v0.1.0 — Stream-Triggered Augmented Generation — Enterprise AI Tech
+        STAG v0.3.0 — Stream-Triggered Augmented Generation — Enterprise AI Tech · local demo (no auth); crew runs are simulations
       </footer>
     </div>
   )

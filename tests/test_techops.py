@@ -30,7 +30,9 @@ from stag.techops import (
     PermissionDenied,
     payload_hash,
 )
-from stag.techops.actions import InvalidActionTransition
+from stag.techops.actions import (
+    InvalidActionTransition,  # noqa: F401  (re-exported; kept for clarity)
+)
 from stag.techops.assignment import Fact
 
 
@@ -57,6 +59,11 @@ def _trigger(event: StreamEvent, rule="pool_timeouts", confidence=0.9) -> Trigge
     )
 
 
+def _resolve(coord: IncidentCoordinator, incident_id: str) -> None:
+    for state in (IncidentState.TRIAGED, IncidentState.INVESTIGATING, IncidentState.VERIFYING, IncidentState.RESOLVED):
+        coord.transition(incident_id, state, "op", "test path")
+
+
 # --------------------------------------------------------------------------- identity
 
 
@@ -64,6 +71,22 @@ class TestIdentity:
     def test_payload_hash_is_stable_and_order_independent(self):
         assert payload_hash({"a": 1, "b": 2}) == payload_hash({"b": 2, "a": 1})
         assert payload_hash({"a": 1}) != payload_hash({"a": 2})
+
+    def test_delimiters_inside_fields_cannot_collide(self):
+        from stag.techops import ObservationIdentity, SignalKey
+
+        a = ObservationIdentity(source="a|b", event_id="c")
+        b = ObservationIdentity(source="a", event_id="b|c")
+        assert a.key != b.key
+        s1 = SignalKey(service="pay|ments", symptom_class="x")
+        s2 = SignalKey(service="pay", symptom_class="ments|x")
+        assert s1.key != s2.key
+
+    def test_same_event_id_from_two_sources_has_distinct_doc_keys(self):
+        e1 = _event(source="datadog")
+        e2 = _event(source="splunk")
+        e2 = e2.model_copy(update={"id": e1.id})
+        assert e1.doc_key != e2.doc_key
 
 
 # --------------------------------------------------------------------------- incident lifecycle
@@ -200,11 +223,65 @@ class TestCoordinatorDedup:
     def test_recurrence_after_resolved_is_new_episode(self):
         coord = IncidentCoordinator(recurrence_window_seconds=3600)
         first = coord.ingest(_event(), _trigger(_event()))
-        coord.transition(first.incident_id, IncidentState.TRIAGED, "op", "triaged")
-        coord.transition(first.incident_id, IncidentState.RESOLVED, "op", "fixed")
+        _resolve(coord, first.incident_id)
         again = coord.ingest(_event(), _trigger(_event()))
         assert again.incident_id != first.incident_id
         assert again.material_change is MaterialChange.RECURRENCE_AFTER_RESOLVED
+        assert coord.get_incident(again.incident_id).attributes["related_incident"] == first.incident_id
+
+    def test_resolved_requires_verification_step(self):
+        coord = IncidentCoordinator()
+        d = coord.ingest(_event(), _trigger(_event()))
+        coord.transition(d.incident_id, IncidentState.TRIAGED, "op", "triaged")
+        with pytest.raises(InvalidTransition):
+            coord.transition(d.incident_id, IncidentState.RESOLVED, "op", "looks fine")
+
+    def test_late_evidence_corrects_timeline_instead_of_reopening(self):
+        coord = IncidentCoordinator(recurrence_window_seconds=3600)
+        first = coord.ingest(_event(), _trigger(_event()))
+        _resolve(coord, first.incident_id)
+        old = _event(timestamp=datetime.now(UTC) - timedelta(days=3))
+        decision = coord.ingest(old, _trigger(old))
+        assert decision.late_evidence and decision.incident_id == first.incident_id
+        assert decision.investigation_request is None
+        assert coord.get_incident(first.incident_id).late_evidence_count == 1
+        assert coord.stats["total_incidents"] == 1
+
+    def test_replay_events_never_create_live_incidents(self):
+        coord = IncidentCoordinator()
+        ev = _event(metadata={"environment": "production", "service": "checkout-api", "replay": True})
+        decision = coord.ingest(ev, _trigger(ev))
+        assert decision.accepted and decision.replay
+        assert decision.incident_id is None and decision.investigation_request is None
+        assert coord.stats["total_incidents"] == 0 and coord.stats["replay_observations"] == 1
+        # a redelivered replay is still a duplicate, not a second observation
+        assert coord.ingest(ev, _trigger(ev)).duplicate
+
+    def test_register_then_correlate_lets_callers_defer_stateful_work(self):
+        coord = IncidentCoordinator()
+        ev = _event()
+        reg = coord.register(ev)
+        assert reg.accepted
+        assert coord.register(ev).duplicate  # before any indexing happened
+        decision = coord.correlate(ev, _trigger(ev), reg)
+        assert decision.incident_id is not None
+        with pytest.raises(ValueError):
+            coord.correlate(_event(), None)  # never registered
+
+    def test_changed_severity_with_same_payload_is_a_conflict_not_a_duplicate(self):
+        coord = IncidentCoordinator()
+        ev = _event(severity=Severity.HIGH)
+        coord.ingest(ev, _trigger(ev))
+        changed = ev.model_copy(update={"severity": Severity.CRITICAL})
+        decision = coord.ingest(changed, _trigger(changed))
+        assert decision.conflicting and not decision.duplicate
+
+    def test_delivery_metadata_does_not_make_a_redelivery_a_conflict(self):
+        coord = IncidentCoordinator()
+        ev = _event(metadata={"environment": "production", "service": "checkout-api", "offset": 1})
+        coord.ingest(ev, _trigger(ev))
+        again = ev.model_copy(update={"metadata": {**ev.metadata, "offset": 2, "delivery_attempt": 2}})
+        assert coord.ingest(again, _trigger(again)).duplicate
 
     def test_no_trigger_records_observation_only(self):
         coord = IncidentCoordinator()
@@ -313,6 +390,30 @@ class TestAssignment:
         )
         assert not findings.partial
 
+    def test_unknown_capability_is_denied_even_if_listed(self):
+        a = InvestigationAssignment.from_yaml(ASSIGNMENT_YAML)
+        a.permissions.capabilities.append("arbitrary_shell")
+        with pytest.raises(PermissionDenied):
+            a.start().use_capability("arbitrary_shell", cmd="rm -rf /")
+
+    def test_assignment_is_snapshotted_at_start(self):
+        a = InvestigationAssignment.from_yaml(ASSIGNMENT_YAML)
+        run = a.start()
+        a.permissions.capabilities.append("read_metrics")
+        a.permissions.production_mutations = True
+        with pytest.raises(PermissionDenied):
+            run.use_capability("read_metrics")
+
+    def test_scope_is_enforced_on_parameters(self):
+        run = InvestigationAssignment.from_yaml(ASSIGNMENT_YAML).start()
+        run.use_capability("query_scoped_logs", service="checkout-api", environment="production")
+        with pytest.raises(PermissionDenied):
+            run.use_capability("query_scoped_logs", service="payments-api")
+        with pytest.raises(PermissionDenied):
+            run.use_capability("read_service_health", environment="staging")
+        with pytest.raises(PermissionDenied):
+            run.use_capability("read_incident_history", incident_id="INC-other")
+
     def test_fact_requires_evidence_reference(self):
         with pytest.raises(ValidationError):
             Fact(statement="unsupported claim", evidence_refs=[])
@@ -348,9 +449,13 @@ class TestActionLedger:
         ledger.dispatch(rec.operation_id)
         ledger.mark_outcome_unknown(rec.operation_id)
         assert rec.state is ActionState.RECONCILING
+        with pytest.raises(InvalidActionTransition):
+            ledger.dispatch(rec.operation_id)  # blind retry from an uncertain state is refused
         ledger.reconcile(rec.operation_id, target_state_observed=True)
-        assert rec.state is ActionState.VERIFIED
+        assert rec.state is ActionState.APPLIED  # applied is not verified
         assert rec.dispatch_attempts == 1  # the action was not repeated
+        ledger.verify(rec.operation_id, healthy=True, evidence={"error_rate": 0.001, "window_s": 600})
+        assert rec.state is ActionState.VERIFIED
 
     def test_reconcile_with_no_effect_retries_same_operation_id(self):
         ledger = ActionLedger()
@@ -359,9 +464,57 @@ class TestActionLedger:
         ledger.dispatch(rec.operation_id)
         ledger.mark_outcome_unknown(rec.operation_id)
         ledger.reconcile(rec.operation_id, target_state_observed=False)
-        assert rec.state is ActionState.DISPATCHED
-        assert rec.dispatch_attempts == 2
+        assert rec.state is ActionState.RETRY_READY
+        assert rec.dispatch_attempts == 1  # reconciliation itself dispatches nothing
+        ledger.dispatch(rec.operation_id)  # one explicit retry, same operation id
+        assert rec.state is ActionState.DISPATCHED and rec.dispatch_attempts == 2
         assert len(ledger.records) == 1
+        # a second lost response exhausts the retry budget
+        ledger.mark_outcome_unknown(rec.operation_id)
+        ledger.reconcile(rec.operation_id, target_state_observed=False)
+        from stag.techops import RetryBudgetExceeded
+
+        with pytest.raises(RetryBudgetExceeded):
+            ledger.dispatch(rec.operation_id)
+
+    def test_terms_are_part_of_the_operation_identity(self):
+        ledger = ActionLedger()
+        a = ledger.prepare("INC-1", "restart", "svc", {}, policy_version="RB-1@v1", preconditions=["x"])
+        b = ledger.prepare("INC-1", "restart", "svc", {}, policy_version="RB-1@v2", preconditions=["x"])
+        c = ledger.prepare("INC-1", "restart", "svc", {}, policy_version="RB-1@v1", preconditions=["x", "y"])
+        assert len({a.operation_id, b.operation_id, c.operation_id}) == 3
+
+    def test_verify_validates_before_writing_and_protects_reserved_fields(self):
+        ledger = ActionLedger()
+        rec = ledger.prepare("INC-1", "restart", "svc")
+        ledger.authorize(rec.operation_id, "oncall", 1)
+        ledger.dispatch(rec.operation_id)
+        ledger.verify(rec.operation_id, healthy=False, evidence={"healthy": True, "error_rate": 0.2})
+        assert rec.state is ActionState.FAILED and rec.verification["healthy"] is False
+        before = dict(rec.verification)
+        with pytest.raises(InvalidActionTransition):
+            ledger.verify(rec.operation_id, healthy=True, evidence={"error_rate": 0.0})
+        assert rec.verification == before  # rejected verification changed nothing
+
+    def test_unknown_verdict_is_recorded_without_changing_state(self):
+        ledger = ActionLedger()
+        rec = ledger.prepare("INC-1", "restart", "svc")
+        ledger.authorize(rec.operation_id, "oncall", 1)
+        ledger.dispatch(rec.operation_id)
+        ledger.verify(rec.operation_id, healthy=None, evidence={"reason": "collector silent"})
+        assert rec.state is ActionState.DISPATCHED
+        assert len(rec.verification["unknown_verdicts"]) == 1
+
+    def test_dispatch_revalidates_freshness_when_given_current_version(self):
+        ledger = ActionLedger()
+        rec = ledger.prepare("INC-1", "restart", "svc")
+        ledger.authorize(rec.operation_id, "oncall", incident_version=4)
+        with pytest.raises(InvalidActionTransition):
+            ledger.dispatch(rec.operation_id, current_incident_version=6)
+        assert rec.state is ActionState.STALE
+        ledger.authorize(rec.operation_id, "oncall", incident_version=6)
+        with pytest.raises(InvalidActionTransition):
+            ledger.dispatch(rec.operation_id, current_incident_version=5)  # approval ahead of incident
 
     def test_stale_approval_requires_reauthorization(self):
         ledger = ActionLedger(max_staleness_versions=0)
@@ -409,6 +562,32 @@ class TestBudget:
         b.reserve("a", 4.0)
         b.reserve("a", 4.0)
         assert b.reserved == 4.0
+
+    def test_negative_nan_and_infinite_amounts_are_rejected(self):
+        b = BudgetLedger(allocation=10.0)
+        b.reserve("a", 1.0)
+        for bad in (-100, float("nan"), float("inf"), "ten"):
+            with pytest.raises(ValueError):
+                b.settle("a", bad)
+            with pytest.raises(ValueError):
+                b.reserve("b", bad)
+        assert b.available == 9.0 and b.spent == 0.0
+        with pytest.raises(ValueError):
+            BudgetLedger(allocation=-1)
+
+    def test_settled_reservation_ref_cannot_be_reused(self):
+        b = BudgetLedger(allocation=10.0)
+        b.reserve("attempt-1", 2.0)
+        b.settle("attempt-1", 1.0)
+        with pytest.raises(ValueError):
+            b.reserve("attempt-1", 2.0)
+        assert b.settle("attempt-1", 5.0).actual == 1.0  # idempotent: second settle is a no-op
+        assert b.spent == 1.0
+
+    def test_zero_allocation_admits_nothing(self):
+        b = BudgetLedger(allocation=0)
+        with pytest.raises(BudgetExhausted):
+            b.reserve("x", 0.01)
 
     def test_allocation_change_requires_authorizer(self):
         b = BudgetLedger(allocation=5.0)

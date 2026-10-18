@@ -50,14 +50,17 @@ after resolved, mitigation failed, cooldown elapsed. Everything else updates cou
 ## Actions
 
 ```text
-PREPARED → AUTHORIZED → DISPATCHED → VERIFIED
+PREPARED → AUTHORIZED → DISPATCHED → APPLIED → VERIFIED
                             ↓
-                     OUTCOME_UNKNOWN → RECONCILING
-AUTHORIZED → STALE when the incident moved since approval
+                     OUTCOME_UNKNOWN → RECONCILING → APPLIED | RETRY_READY → (explicit retry) DISPATCHED
+AUTHORIZED / RETRY_READY → STALE when the incident moved since approval
 ```
 
-Retries reuse the operation id. Reconciliation reads the target's state. Verification is
-independent and windowed; missing telemetry is unknown.
+Nothing is dispatchable from an uncertain state. Reconciliation reads the target's state and
+yields APPLIED (effect present, still unverified) or RETRY_READY (effect absent; one explicit retry
+within budget, same operation id). Verification is independent and windowed; unknown telemetry is
+recorded and never resolves. Operation ids cover incident, step, target, parameters, policy version
+and preconditions.
 
 ## Enterprise shape
 

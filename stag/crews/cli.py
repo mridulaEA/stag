@@ -12,12 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 import structlog
 
 from stag.crews.loader import CREWS_DIR, discover_crews, load_crew, load_scenario, validate_all
-from stag.crews.runner import run_crew
+from stag.crews.runner import check_expectations, run_crew
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -87,6 +88,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "validate":
         report = validate_all(args.crews_dir)
+        if not report:
+            print(f"FAIL no crews found under {args.crews_dir} (missing catalog)", file=sys.stderr)
+            return 1
         bad = 0
         for name, problems in report.items():
             print(f"{'FAIL' if problems else 'ok':4s} {name}")
@@ -98,16 +102,29 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command in ("run", "run-all"):
         crews = [load_crew(args.name, args.crews_dir)] if args.command == "run" else discover_crews(args.crews_dir)
+        if not crews:
+            print("no crews found", file=sys.stderr)
+            return 1
         reports = []
+        problems: list[str] = []
         for crew in crews:
             scenario = load_scenario(crew, getattr(args, "scenario", None))
-            reports.append(run_crew(crew, scenario, auto_approve=args.auto_approve))
+            report = run_crew(crew, scenario, auto_approve=args.auto_approve)
+            reports.append(report)
+            if report.failed_steps:
+                problems.append(f"{crew.name}: {report.failed_steps} failed step(s)")
+            problems.extend(f"{crew.name}: {f}" for f in check_expectations(report, scenario, args.auto_approve))
         if args.json:
-            print(json.dumps([r.model_dump(mode="json") | {"model_calls_avoided": r.model_calls_avoided, "resolved": r.resolved, "held": r.held} for r in reports], indent=2, default=str))
+            print(json.dumps([r.model_dump(mode="json") | {"model_calls_avoided": r.model_calls_avoided, "resolved": r.resolved, "held": r.held, "failed_steps": r.failed_steps} for r in reports], indent=2, default=str))
         else:
             for r in reports:
                 print(r.to_markdown())
                 print()
+        if problems:
+            print("RUN FAILED:", file=sys.stderr)
+            for pr in problems:
+                print(f"  - {pr}", file=sys.stderr)
+            return 1
         return 0
 
     return 2

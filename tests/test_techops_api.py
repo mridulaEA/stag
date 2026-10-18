@@ -15,6 +15,11 @@ class StubPipeline:
         self.coordinator = coordinator
         self._running = True
 
+        class _Gen:
+            stats = {"has_client": False}
+
+        self.generator = _Gen()
+
 
 def _event():
     return StreamEvent(
@@ -68,43 +73,65 @@ def test_transition_is_explicit_and_validated(client):
 
 def test_action_ledger_flow_over_api(client):
     inc = client.get("/api/techops/incidents").json()["incidents"][0]
-    prepared = client.post(
-        "/api/techops/actions/prepare",
-        json={"incident_id": inc["id"], "plan_step": "restart_component", "target": "checkout-api",
-              "parameters": {"replicas": 2}, "policy_version": "RB-17@v3"},
-    ).json()
-    again = client.post(
-        "/api/techops/actions/prepare",
-        json={"incident_id": inc["id"], "plan_step": "restart_component", "target": "checkout-api",
-              "parameters": {"replicas": 2}},
-    ).json()
+    body = {"incident_id": inc["id"], "plan_step": "restart_component", "target": "checkout-api",
+            "parameters": {"replicas": 2}, "policy_version": "RB-17@v3"}
+    prepared = client.post("/api/techops/actions/prepare", json=body).json()
+    again = client.post("/api/techops/actions/prepare", json=body).json()
     assert prepared["operation_id"] == again["operation_id"]
     op = prepared["operation_id"]
 
+    # a different policy version is a different operation
+    other = client.post("/api/techops/actions/prepare", json={**body, "policy_version": "RB-17@v4"}).json()
+    assert other["operation_id"] != op
+
     assert client.post(f"/api/techops/actions/{op}/dispatch").status_code == 409  # not authorized
 
-    auth = client.post(f"/api/techops/actions/{op}/authorize",
-                       json={"actor": "oncall@corp", "incident_version": inc["version"]})
-    assert auth.json()["state"] == "authorized"
+    # approval is bound to the server's current incident version; a wrong expectation is rejected
+    assert client.post(f"/api/techops/actions/{op}/authorize",
+                       json={"actor": "oncall@corp", "expected_incident_version": inc["version"] + 7}).status_code == 409
+    auth = client.post(f"/api/techops/actions/{op}/authorize", json={"actor": "oncall@corp"}).json()
+    assert auth["state"] == "authorized" and auth["authorized_at_incident_version"] == inc["version"]
 
-    stale = client.post(f"/api/techops/actions/{op}/dispatch",
-                        params={"current_incident_version": inc["version"] + 3})
-    assert stale.status_code == 409
+    # the incident moves (new evidence) → dispatch is refused by the ledger without any caller version
+    client.post(f"/api/techops/incidents/{inc['id']}/transition",
+                json={"to": "triaged", "actor": "oncall@corp", "reason": "impact confirmed"})
+    stale = client.post(f"/api/techops/actions/{op}/dispatch")
+    assert stale.status_code == 409 and "stale" in stale.json()["detail"].lower()
 
-    client.post(f"/api/techops/actions/{op}/authorize",
-                json={"actor": "oncall@corp", "incident_version": inc["version"] + 3})
-    disp = client.post(f"/api/techops/actions/{op}/dispatch",
-                       params={"current_incident_version": inc["version"] + 3})
-    assert disp.json()["state"] == "dispatched"
+    client.post(f"/api/techops/actions/{op}/authorize", json={"actor": "oncall@corp"})
+    disp = client.post(f"/api/techops/actions/{op}/dispatch")
+    assert disp.status_code == 200 and disp.json()["state"] == "dispatched"
 
     unknown = client.post(f"/api/techops/actions/{op}/outcome-unknown").json()
     assert unknown["state"] == "reconciling"
+    assert client.post(f"/api/techops/actions/{op}/dispatch").status_code == 409  # no blind retry
     rec = client.post(f"/api/techops/actions/{op}/reconcile", params={"target_state_observed": True}).json()
-    assert rec["state"] == "verified" and rec["dispatch_attempts"] == 1
+    assert rec["state"] == "applied" and rec["dispatch_attempts"] == 1
+    ver = client.post(f"/api/techops/actions/{op}/verify",
+                      json={"healthy": True, "evidence": {"error_rate": 0.001, "window_s": 600}}).json()
+    assert ver["state"] == "verified" and ver["verification"]["healthy"] is True
 
     actions = client.get("/api/techops/actions").json()
-    assert actions["stats"]["operations"] == 1
-    assert client.get(f"/api/techops/incidents/{inc['id']}").json()["actions"][0]["operation_id"] == op
+    assert actions["stats"]["operations"] == 2
+    assert client.get(f"/api/techops/incidents/{inc['id']}").json()["actions"][0]["operation_id"] in (op, other["operation_id"])
+
+
+def test_actions_require_an_existing_open_incident(client):
+    assert client.post("/api/techops/actions/prepare",
+                       json={"incident_id": "INC-NOPE", "plan_step": "restart", "target": "x"}).status_code == 404
+    assert client.post("/api/techops/actions/OP-nope/authorize", json={"actor": "a"}).status_code == 404
+    assert client.post("/api/techops/actions/OP-nope/dispatch").status_code == 404
+
+
+def test_health_reports_component_readiness(client):
+    body = client.get("/api/health").json()
+    assert body["components"]["techops_coordinator"] == "enabled"
+    assert body["status"] in ("ok", "degraded") and body["mode"] == "local-demo"
+
+
+def test_query_limits_are_bounded(client):
+    assert client.get("/api/events", params={"limit": 0}).status_code == 422
+    assert client.get("/api/knowledge/search", params={"q": "", "top_k": 5}).status_code == 422
 
 
 def test_coordinator_disabled_returns_404():
@@ -127,8 +154,12 @@ def test_crews_catalog_and_dry_run(client):
     assert client.get("/api/crews/nope").status_code == 404
 
     held = client.post("/api/crews/techops-incident-triage/run", json={}).json()
-    assert held["held"] == 2 and held["resolved"] == 0
+    assert held["held"] == 2 and held["resolved"] == 0 and held["mode"] == "simulation"
     done = client.post("/api/crews/techops-incident-triage/run", json={"auto_approve": True}).json()
-    assert done["resolved"] == 2 and "model_calls_avoided" in done and done["markdown"].startswith("# Crew run")
+    assert done["resolved"] == 2 and "model_calls_avoided" in done and "[SIMULATION]" in done["markdown"]
+    # invalid scenario input is a 422, not a 500
+    bad = client.post("/api/crews/techops-incident-triage/run",
+                      json={"scenario": {"name": "x", "events": [{"source": "s", "event_type": "nope"}]}})
+    assert bad.status_code == 422
     # dry runs never touch the live coordinator
     assert client.get("/api/techops/incidents").json()["stats"]["total_incidents"] == 1

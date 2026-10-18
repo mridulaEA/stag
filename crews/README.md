@@ -1,5 +1,8 @@
 # STAG Crews
 
+> All crew runs are **simulations**: fixture verdicts, ledger-only actions, simulated approvals.
+> They prove the control flow, not a live operation. See `docs/STATUS.md`.
+
 A **crew** is a ready-made team for one operational use case: roles (agents + skills + least
 permissions, with a human approver), a workflow written only in backbone operations, and a scenario
 that proves it runs end-to-end. Crews are declarative (`crews/<name>/crew.yaml`) and run on the

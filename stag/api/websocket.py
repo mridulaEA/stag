@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import structlog
@@ -13,8 +14,9 @@ logger = structlog.get_logger()
 class ConnectionManager:
     """Manages WebSocket connections and broadcasts pipeline events."""
 
-    def __init__(self) -> None:
+    def __init__(self, send_timeout: float = 2.0) -> None:
         self._connections: list[WebSocket] = []
+        self.send_timeout = send_timeout
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -27,16 +29,22 @@ class ConnectionManager:
         logger.info("ws.disconnected", total=len(self._connections))
 
     async def broadcast(self, data: dict) -> None:
-        """Broadcast a message to all connected WebSocket clients."""
-        dead = []
+        """Broadcast to all clients concurrently; a slow or dead client cannot delay the others."""
+        if not self._connections:
+            return
         message = json.dumps(data, default=str)
-        for ws in self._connections:
+
+        async def send(ws: WebSocket) -> WebSocket | None:
             try:
-                await ws.send_text(message)
+                await asyncio.wait_for(ws.send_text(message), timeout=self.send_timeout)
+                return None
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
+                return ws
+
+        results = await asyncio.gather(*(send(ws) for ws in list(self._connections)))
+        for ws in results:
+            if ws is not None:
+                self.disconnect(ws)
 
     @property
     def connection_count(self) -> int:

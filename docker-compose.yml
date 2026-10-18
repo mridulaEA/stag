@@ -4,9 +4,10 @@ services:
   stag:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"   # local demo: the API has no authentication; keep it loopback-bound
     environment:
       - STREAM_SOURCE=simulator
+      - TECHOPS_COORDINATOR_ENABLED=true
       - SIMULATOR_INTERVAL=3.0
       - LLM_PROVIDER=openai
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}

@@ -163,11 +163,24 @@ class InvestigationFindings(BaseModel):
         return not self.missing_required(assignment)
 
 
+KNOWN_CAPABILITIES = READ_ONLY_CAPABILITIES | MUTATING_CAPABILITIES
+
+# Parameter names that carry scope. A capability call naming a service / environment / incident
+# outside the assignment scope is denied before any I/O.
+SCOPE_PARAMS_SERVICE = ("service", "service_id", "service_ids", "dataset", "target")
+SCOPE_PARAMS_ENVIRONMENT = ("environment", "env")
+SCOPE_PARAMS_INCIDENT = ("incident_id",)
+
+
 class BoundedRun:
-    """Runtime enforcement of an assignment. The executor, not the prompt, enforces the contract."""
+    """Runtime enforcement of an assignment. The executor, not the prompt, enforces the contract.
+
+    The assignment is snapshotted at start: mutating the original object afterwards has no effect
+    on what this run permits.
+    """
 
     def __init__(self, assignment: InvestigationAssignment) -> None:
-        self.assignment = assignment
+        self.assignment = assignment.model_copy(deep=True)
         self.model_calls = 0
         self.tool_calls = 0
         self.started_at = time.monotonic()
@@ -197,14 +210,39 @@ class BoundedRun:
             raise LimitExceeded("max_model_calls exceeded")
         self.model_calls += 1
 
+    def _check_scope(self, capability: str, params: dict[str, Any]) -> None:
+        scope = self.assignment.scope
+        for key in SCOPE_PARAMS_INCIDENT:
+            if key in params and str(params[key]) != scope.incident_id:
+                raise PermissionDenied(f"{capability}: incident '{params[key]}' is outside scope {scope.incident_id}")
+        for key in SCOPE_PARAMS_ENVIRONMENT:
+            if key in params and scope.environment not in ("unknown", "") and str(params[key]) != scope.environment:
+                raise PermissionDenied(f"{capability}: environment '{params[key]}' is outside scope {scope.environment}")
+        if scope.service_ids:
+            for key in SCOPE_PARAMS_SERVICE:
+                if key not in params:
+                    continue
+                values = params[key] if isinstance(params[key], (list, tuple, set)) else [params[key]]
+                outside = [str(v) for v in values if str(v) not in scope.service_ids]
+                if outside:
+                    raise PermissionDenied(f"{capability}: service(s) {outside} are outside scope {scope.service_ids}")
+
     def use_capability(self, capability: str, **params: Any) -> None:
-        """Authorize one tool call. Raises PermissionDenied or LimitExceeded; otherwise records it."""
+        """Authorize one tool call. Raises PermissionDenied or LimitExceeded; otherwise records it.
+
+        Checks, in order: known capability catalog → granted by the assignment → scope of the
+        parameters (incident, environment, services) → tool-call limit.
+        """
         self.check_runtime()
+        if capability not in KNOWN_CAPABILITIES:
+            self.denied.append(capability)
+            raise PermissionDenied(f"capability '{capability}' is not in the approved catalog")
         if not self.assignment.permissions.allows(capability):
             self.denied.append(capability)
             raise PermissionDenied(
                 f"capability '{capability}' is outside assignment for {self.assignment.scope.incident_id}"
             )
+        self._check_scope(capability, params)
         if self.tool_calls >= self.assignment.limits.max_tool_calls:
             raise LimitExceeded("max_tool_calls exceeded")
         self.tool_calls += 1

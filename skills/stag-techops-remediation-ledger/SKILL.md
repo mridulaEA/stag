@@ -16,11 +16,18 @@ exact plan step, target, parameters, policy version and preconditions. Retries r
 operation id. A different operation requires a new reviewed decision.
 
 ```text
-PREPARED → AUTHORIZED → DISPATCHED → VERIFIED
+PREPARED → AUTHORIZED → DISPATCHED → APPLIED → VERIFIED
+                            ↓            ↓
+                     OUTCOME_UNKNOWN   FAILED
                             ↓
-                     OUTCOME_UNKNOWN → RECONCILING → VERIFIED / FAILED / (one retry)
-AUTHORIZED → STALE (incident changed since approval) → re-AUTHORIZE or REJECT
+                       RECONCILING ──► APPLIED      (destination shows the effect; verify next)
+                                   ──► RETRY_READY  (destination proves absence; ONE explicit retry, same id)
+                                   ──► FAILED
+AUTHORIZED / RETRY_READY → STALE (incident changed since approval) → re-AUTHORIZE or REJECT
 ```
+
+Operation identity covers incident, plan step, target, parameters, **policy version and
+preconditions**. APPLIED is not VERIFIED: the destination confirming a change is not recovery.
 
 ## Three permissions, three actors
 
@@ -47,15 +54,18 @@ preconditions and staleness.
 2. **Authorize** — an accountable actor approves the exact target + parameters at a known
    `incident_version`. Show reviewers the evidence and the proposed change, not just an "Approve"
    button. Record who, when, under which policy.
-3. **Revalidate, then dispatch** — before execution, `revalidate(op, current_incident_version)`.
-   If the incident moved (another operator fixed it, new evidence), the approval is `STALE`;
-   stop. Otherwise `dispatch(op)`; attempts are counted on the same id.
+3. **Revalidate, then dispatch** — `dispatch(op, current_incident_version=incident.version)`
+   revalidates inside the ledger from the incident's *current* version. If the incident moved
+   (another operator fixed it, new evidence), the approval is `STALE`; stop and re-approve.
+   Over the API the version is read from server state; callers cannot supply one.
    Concurrency control must prevent two workers committing conflicting actions, not merely two
    identical model calls.
 4. **Handle uncertainty explicitly** — on timeout / lost response call
-   `mark_outcome_unknown(op)` → `RECONCILING`. Query the **target's** state. If the change is
-   present → `reconcile(op, True)` (VERIFIED, no retry). If absent → `reconcile(op, False)`
-   (one retry, same id). Never mint a new operation id for a retry.
+   `mark_outcome_unknown(op)` → `RECONCILING`. Nothing is dispatchable from here. Query the
+   **target's** state. If the change is present → `reconcile(op, True)` → `APPLIED` (then verify).
+   If absent → `reconcile(op, False)` → `RETRY_READY`; the retry is a separate, explicit
+   `dispatch(op, current_incident_version=…)` that re-checks freshness and the retry budget.
+   Never mint a new operation id for a retry.
    If the destination offers no reliable idempotency or queryable operation id, you cannot
    manufacture exactly-once with a local flag: stop blind retries and escalate.
 5. **Verify** — hand off to `stag-techops-recovery-verification`. `verify(op, healthy, evidence)`

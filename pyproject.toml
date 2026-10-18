@@ -59,7 +59,7 @@ stag-crews = "stag.crews.cli:main"
 include = ["stag*"]
 
 [tool.setuptools.package-data]
-stag = ["py.typed"]
+stag = ["py.typed", "_assets/**/*"]
 
 [tool.ruff]
 target-version = "py311"

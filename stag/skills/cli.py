@@ -27,12 +27,14 @@ import json
 import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-SKILLS_DIR = REPO_ROOT / "skills"
-AGENTS_DIR = REPO_ROOT / "agents"
+from stag._resources import MissingCatalog, asset_dir
+
+SKILLS_DIR = asset_dir("skills")
+AGENTS_DIR = asset_dir("agents")
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MAX_NAME = 64
@@ -174,7 +176,19 @@ def _dest_root(target: str, scope: str, project_dir: Path, home: Path) -> Path:
     return base / rel
 
 
+def _is_source(src: Path, dest: Path) -> bool:
+    """True when ``dest`` *is* the canonical source (directly or through a symlinked parent)."""
+    try:
+        resolved_dest = dest.resolve()
+    except OSError:
+        return False
+    resolved_src = src.resolve()
+    return resolved_dest == resolved_src or resolved_src in resolved_dest.parents or resolved_dest in resolved_src.parents
+
+
 def _link_or_copy(src: Path, dest: Path, mode: str, force: bool) -> str:
+    if _is_source(src, dest):
+        return "source"  # never delete or overwrite the canonical skill
     if dest.exists() or dest.is_symlink():
         if not force:
             return "exists"
@@ -201,15 +215,30 @@ def install(
     home: Path | None = None,
     force: bool = False,
     only: set[str] | None = None,
+    mode: str | None = None,
 ) -> list[tuple[str, str, str, str]]:
-    """Install skills. Returns (target, skill, destination, outcome) tuples."""
+    """Install skills. Returns (target, skill, destination, outcome) tuples.
+
+    ``mode`` is ``link`` (default for project scope) or ``copy`` (default for user scope and for
+    installs from an ephemeral clone, where a link would dangle once the clone is removed).
+    Raises MissingCatalog when the source pack is empty and ValueError for unknown skill names.
+    """
     project_dir = project_dir or Path.cwd()
     home = home or Path.home()
-    mode = "link" if scope == "project" else "copy"
+    mode = mode or ("link" if scope == "project" else "copy")
+    if mode not in ("link", "copy"):
+        raise ValueError("mode must be 'link' or 'copy'")
+    skills = discover_skills(skills_dir)
+    if not skills:
+        raise MissingCatalog(f"no skills found under {skills_dir}")
+    if only:
+        unknown = sorted(only - {s.name for s in skills})
+        if unknown:
+            raise ValueError(f"unknown skill(s): {', '.join(unknown)}")
     results = []
     for target in targets:
         root = _dest_root(target, scope, project_dir, home)
-        for skill in discover_skills(skills_dir):
+        for skill in skills:
             if only and skill.name not in only:
                 continue
             outcome = _link_or_copy(skill.path, root / skill.name, mode, force)
@@ -227,18 +256,22 @@ def uninstall(
     project_dir = project_dir or Path.cwd()
     home = home or Path.home()
     results = []
-    names = {s.name for s in discover_skills(skills_dir)}
+    sources = {s.name: s.path for s in discover_skills(skills_dir)}
     for target in targets:
         root = _dest_root(target, scope, project_dir, home)
         if not root.exists():
             continue
         for child in root.iterdir():
-            if child.name in names:
-                if child.is_symlink() or child.is_file():
-                    child.unlink()
-                else:
-                    shutil.rmtree(child)
-                results.append((target, child.name, "removed"))
+            if child.name not in sources:
+                continue
+            if _is_source(sources[child.name], child):
+                results.append((target, child.name, "kept (canonical source)"))
+                continue
+            if child.is_symlink() or child.is_file():
+                child.unlink()
+            else:
+                shutil.rmtree(child)
+            results.append((target, child.name, "removed"))
     return results
 
 
@@ -273,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     p_inst.add_argument("--home", type=Path, default=Path.home())
     p_inst.add_argument("--force", action="store_true", help="replace existing entries")
     p_inst.add_argument("--only", help="comma-separated skill names")
+    p_inst.add_argument("--mode", choices=("link", "copy"), help="link (default project) or copy (default user)")
 
     p_un = sub.add_parser("uninstall", help="remove installed STAG skills")
     p_un.add_argument("--target", default="all")
@@ -284,6 +318,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "list":
         skills = discover_skills(args.skills_dir)
+        if not skills:
+            print(f"error: no skills found under {args.skills_dir}", file=sys.stderr)
+            return 1
         if args.domain:
             skills = [s for s in skills if s.domain == args.domain]
         if args.json:
@@ -296,6 +333,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "validate":
         report = validate_all(args.skills_dir)
+        if not report:
+            print(f"FAIL no skills found under {args.skills_dir} (missing catalog)", file=sys.stderr)
+            return 1
         bad = {k: v for k, v in report.items() if v}
         for name, errs in report.items():
             status = "FAIL" if errs else "ok"
@@ -308,7 +348,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         targets = _resolve_targets(args.target)
         only = {n.strip() for n in args.only.split(",")} if args.only else None
-        for target, name, dest, outcome in install(targets, args.scope, args.skills_dir, args.project_dir, args.home, args.force, only):
+        try:
+            results = install(targets, args.scope, args.skills_dir, args.project_dir, args.home, args.force, only, args.mode)
+        except (MissingCatalog, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        for target, name, dest, outcome in results:
             print(f"{outcome:7s} {target:6s} {name} -> {dest}")
         return 0
 

@@ -25,14 +25,16 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from stag.crews.schema import (
+    POLICY_SEVERITY_CEILING,
     AuthorizePolicy,
     Crew,
     Role,
     Scenario,
     Step,
     StepAction,
+    Verdict,
 )
-from stag.models.schemas import EventType, Severity, StreamEvent, TriggerResult
+from stag.models.schemas import StreamEvent, TriggerResult
 from stag.techops import (
     ActionLedger,
     ActionRecord,
@@ -42,6 +44,7 @@ from stag.techops import (
     Incident,
     IncidentCoordinator,
     IncidentState,
+    InvalidActionTransition,
     InvalidTransition,
     InvestigationAssignment,
     InvestigationFindings,
@@ -59,6 +62,7 @@ from stag.triggers import RuleRegistry, TriggerEngine
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 MAX_REINVESTIGATION_LOOPS = 2
+MAX_STEP_EXECUTIONS_FACTOR = 3  # a workflow may execute at most 3x its step count (bounded loops)
 
 
 def _now() -> datetime:
@@ -162,13 +166,20 @@ class DeterministicExecutor:
         )
 
     def verify(self, crew, incident, action, hint):
-        verdict = {"healthy": True, "not_recovered": False, "unknown": None}.get(hint, True)
+        """Fixture verdicts only. Anything that is not an exact Verdict is UNKNOWN (fail closed)."""
+        try:
+            verdict = Verdict(hint)
+        except ValueError:
+            verdict = Verdict.UNKNOWN
+        healthy = {Verdict.HEALTHY: True, Verdict.NOT_RECOVERED: False, Verdict.UNKNOWN: None}[verdict]
         evidence = {
+            "simulated": True,
+            "source": "scenario fixture (not a measured observation)",
             "window": "observation window per crew policy",
             "signals": ["service_health", "impact_metric", "telemetry_freshness"],
-            "hint": hint,
+            "fixture_verdict": verdict.value,
         }
-        return verdict, evidence
+        return healthy, evidence
 
     def notify(self, crew, step, incident, context):
         return {
@@ -221,7 +232,12 @@ class IncidentRun(BaseModel):
 
 
 class CrewRunReport(BaseModel):
+    """Result of a crew run. ``mode`` is always ``simulation`` for this runner: verdicts come from
+    scenario fixtures, actions change ledger records only, and approvals are simulated flags.
+    """
+
     run_id: str = Field(default_factory=lambda: f"RUN-{uuid4().hex[:8]}")
+    mode: str = "simulation"
     crew: str
     scenario: str
     started_at: datetime = Field(default_factory=_now)
@@ -229,6 +245,8 @@ class CrewRunReport(BaseModel):
     triggers_fired: int = 0
     duplicate_deliveries: int = 0
     conflicting_deliveries: int = 0
+    replay_observations: int = 0
+    late_evidence: int = 0
     evidence_only_updates: int = 0
     investigations_requested: int = 0
     incidents: list[IncidentRun] = Field(default_factory=list)
@@ -239,7 +257,16 @@ class CrewRunReport(BaseModel):
 
     @property
     def model_calls_avoided(self) -> int:
+        """Investigations *not started* because of dedup or evidence-only updates.
+
+        This counts suppressed investigation triggers, not measured provider spend; see
+        docs/review/FINDINGS.md R31 for the measured-cost plan.
+        """
         return self.duplicate_deliveries + self.evidence_only_updates
+
+    @property
+    def failed_steps(self) -> int:
+        return sum(1 for inc in self.incidents for s in inc.steps if s.status == "failed")
 
     @property
     def resolved(self) -> int:
@@ -251,12 +278,16 @@ class CrewRunReport(BaseModel):
 
     def to_markdown(self) -> str:
         lines = [
-            f"# Crew run {self.run_id}: {self.crew} / {self.scenario}",
+            f"# Crew run {self.run_id} [{self.mode.upper()}]: {self.crew} / {self.scenario}",
+            "",
+            "_Simulation: fixture verdicts, ledger-only actions, simulated approvals. Not a live operation._",
             "",
             f"- events ingested: {self.events_ingested}; triggers fired: {self.triggers_fired}",
             f"- duplicate deliveries: {self.duplicate_deliveries}; conflicting: {self.conflicting_deliveries}; "
+            f"replay: {self.replay_observations}; late evidence: {self.late_evidence}; "
             f"evidence-only updates: {self.evidence_only_updates}",
-            f"- investigations requested: {self.investigations_requested}; **model calls avoided: {self.model_calls_avoided}**",
+            f"- investigations requested: {self.investigations_requested}; "
+            f"**investigations suppressed by dedup/evidence-only updates: {self.model_calls_avoided}**",
             f"- incidents: {len(self.incidents)}; resolved: {self.resolved}; halted/awaiting: {self.held}",
             f"- budget: {self.budget}",
             "",
@@ -317,8 +348,24 @@ class CrewRunner:
         )
 
     def ingest(self, event: StreamEvent):
+        """Identity first: duplicates and conflicts never reach stateful trigger rules."""
+        registration = self.coordinator.register(event)
+        if not registration.accepted:
+            incident = (
+                self.coordinator.get_incident(registration.prior_incident_id)
+                if registration.prior_incident_id and self.coordinator.has_incident(registration.prior_incident_id)
+                else None
+            )
+            from stag.techops import CoordinatorDecision
+
+            return None, CoordinatorDecision(
+                accepted=False, duplicate=registration.duplicate, conflicting=registration.conflicting,
+                replay=registration.replay, incident_id=registration.prior_incident_id,
+                incident_state=incident.state if incident else None,
+                incident_version=incident.version if incident else None, reason=registration.reason,
+            )
         trigger = self.engine.evaluate(event)
-        decision = self.coordinator.ingest(event, trigger)
+        decision = self.coordinator.correlate(event, trigger, registration)
         if decision.incident_id and decision.incident_id not in self._first_event:
             self._first_event[decision.incident_id] = event
         return trigger, decision
@@ -332,8 +379,8 @@ class CrewRunner:
             for _ in range(max(1, spec.repeat)):
                 kwargs: dict[str, Any] = dict(
                     source=spec.source,
-                    event_type=EventType(spec.event_type),
-                    severity=Severity(spec.severity),
+                    event_type=spec.event_type,
+                    severity=spec.severity,
                     payload=dict(spec.payload),
                     metadata=dict(spec.metadata),
                 )
@@ -354,6 +401,10 @@ class CrewRunner:
                 report.duplicate_deliveries += 1
             elif decision.conflicting:
                 report.conflicting_deliveries += 1
+            elif decision.replay:
+                report.replay_observations += 1
+            elif decision.late_evidence:
+                report.late_evidence += 1
             elif decision.incident_id and decision.investigation_request is None:
                 report.evidence_only_updates += 1
             if decision.investigation_request is not None:
@@ -382,8 +433,15 @@ class CrewRunner:
         steps = self.crew.workflow
         index = 1  # step 0 is coordinate (already done at ingest)
         context: dict[str, Any] = {"operation_ids": [], "findings": None, "loops": 0, "verifications": 0}
+        executed = 0
+        budget_steps = MAX_STEP_EXECUTIONS_FACTOR * len(steps)
         while index < len(steps):
             step = steps[index]
+            executed += 1
+            if executed > budget_steps:
+                run.halted_at, run.halt_reason = step.step, f"step budget exceeded ({budget_steps}); possible loop"
+                run.steps.append(StepRecord(step=step.step, action=step.action, role=step.role, status="failed", detail={"reason": run.halt_reason}))
+                break
             try:
                 record, jump = self._execute(step, incident, context)
             except Exception as e:  # a bug in a step must surface, not be swallowed
@@ -463,14 +521,20 @@ class CrewRunner:
             )
             ref = f"{incident.id}:{step.step}:v{incident.version}"
             try:
-                self.budget.reserve(ref, 1.0 * assignment.limits.max_model_calls)
+                self.budget.reserve(ref, 1.0 * max(1, assignment.limits.max_model_calls))
             except BudgetExhausted as e:
+                self._ensure(incident, IncidentState.HELD, actor, "budget exhausted")
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="held", detail={"reason": f"budget exhausted: {e}"}), None
             bounded = assignment.start()
             next_plan = next((s.plan_step for s in self.crew.workflow if s.action is StepAction.PROPOSE_ACTION), None)
-            findings = self.executor.investigate(self.crew, role, incident, bounded, {"next_plan_step": next_plan})
-            findings = bounded.finish(findings)
-            self.budget.settle(ref, float(bounded.model_calls))
+            try:
+                findings = self.executor.investigate(self.crew, role, incident, bounded, {"next_plan_step": next_plan})
+                findings = bounded.finish(findings)
+            except LimitExceeded as e:
+                findings = InvestigationFindings(partial=True, escalate=True, contradictory_or_missing_evidence=[f"limit reached: {e}"])
+            finally:
+                # settle what was actually consumed, even when the executor failed
+                self.budget.settle(ref, float(bounded.model_calls))
             context["findings"] = findings.model_dump(mode="json")
             detail.update(
                 {
@@ -483,8 +547,14 @@ class CrewRunner:
                     "proposed_next_step": findings.proposed_next_step,
                 }
             )
-            if findings.partial and findings.escalate:
-                detail["reason"] = "partial findings; escalated"
+            if findings.partial:
+                # Partial or escalated findings never advance to proposal/dispatch on their own.
+                self._ensure(incident, IncidentState.HELD, actor, "partial findings; human review required")
+                detail["reason"] = (
+                    "partial findings (missing: "
+                    + ", ".join(findings.missing_required(assignment)) + "); escalated for human review"
+                )
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="held", detail=detail), None
             return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), None
 
         if step.action is StepAction.PROPOSE_ACTION:
@@ -508,11 +578,13 @@ class CrewRunner:
             record = self.ledger.get(op_id)
             if record.state is ActionState.STALE:
                 pass  # re-authorization path below
+            elif record.state is ActionState.RETRY_READY:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": "operation already authorized; retry pending", "operation_id": op_id}), None
             elif record.state is not ActionState.PREPARED:
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": f"operation already {record.state.value}", "operation_id": op_id}), None
             severity_ok = (
                 policy.mode == "policy"
-                and policy.auto_if_severity_at_most is not None
+                and policy.auto_if_severity_at_most in POLICY_SEVERITY_CEILING
                 and SEVERITY_ORDER[incident.severity.value] <= SEVERITY_ORDER[policy.auto_if_severity_at_most]
             )
             if severity_ok:
@@ -523,7 +595,7 @@ class CrewRunner:
                 self._ensure(incident, IncidentState.HELD, actor, "awaiting human authorization")
                 return StepRecord(
                     step=step.step, action=step.action, role=step.role, status="held",
-                    detail={"operation_id": op_id, "reason": "awaiting human authorization (run with auto_approve or approve via /api/techops/actions)"},
+                    detail={"operation_id": op_id, "reason": "awaiting human authorization (simulation: re-run with auto_approve to model the approver)"},
                 ), None
             # Record the lifecycle transition first so the approval is bound to the resulting version;
             # any later evidence or state change then makes the approval STALE at dispatch time.
@@ -536,13 +608,15 @@ class CrewRunner:
             op_id = context["operation_ids"][-1] if context["operation_ids"] else None
             if op_id is None:
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": "no action to dispatch"}), None
-            record = self.ledger.revalidate(op_id, incident.version)
-            if record.state is ActionState.STALE:
-                return StepRecord(step=step.step, action=step.action, role=step.role, status="held", detail={"operation_id": op_id, "reason": "approval stale; incident changed since authorization"}), None
-            if record.state is not ActionState.AUTHORIZED:
+            record = self.ledger.get(op_id)
+            if record.state not in (ActionState.AUTHORIZED, ActionState.RETRY_READY):
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"operation_id": op_id, "reason": f"operation is {record.state.value}"}), None
-            self.ledger.dispatch(op_id, actor=actor)
-            detail.update({"operation_id": op_id, "attempts": record.dispatch_attempts})
+            try:
+                # Freshness is decided by the ledger from the incident's current version, not by the caller.
+                self.ledger.dispatch(op_id, actor=actor, current_incident_version=incident.version)
+            except InvalidActionTransition as e:
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="held", detail={"operation_id": op_id, "reason": f"not dispatched: {e}"}), None
+            detail.update({"operation_id": op_id, "attempts": record.dispatch_attempts, "simulated": True})
             detail["implicit_transitions"] = self._ensure(incident, IncidentState.EXECUTING, actor, step.step)
             return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), None
 
@@ -553,19 +627,21 @@ class CrewRunner:
             hints = self._verification_hints
             hint = hints.get(
                 f"{incident.signal_key}#{context['verifications']}",
-                hints.get(incident.signal_key, hints.get("default", "healthy")),
+                hints.get(incident.signal_key, hints.get("default", Verdict.UNKNOWN)),
             )
             healthy, evidence = self.executor.verify(self.crew, incident, record, hint)
+            if healthy not in (True, False, None):
+                healthy = None  # an executor returning anything else is treated as unknown
             verdict = {True: "healthy", False: "not_recovered", None: "unknown"}[healthy]
             detail.update({"operation_id": op_id, "verdict": verdict, "evidence": evidence})
             detail["implicit_transitions"] = self._ensure(incident, IncidentState.VERIFYING, actor, step.step)
+            if record is not None and record.state in (ActionState.DISPATCHED, ActionState.APPLIED):
+                self.ledger.verify(op_id, healthy=healthy, evidence=evidence, actor=actor)
             if healthy is None:
                 return StepRecord(
                     step=step.step, action=step.action, role=step.role, status="awaiting",
-                    detail={**detail, "reason": "telemetry missing or stale; recovery unknown — not resolving"},
+                    detail={**detail, "reason": "no verification evidence (missing fixture or telemetry); recovery unknown — not resolving"},
                 ), None
-            if record is not None and record.state is ActionState.DISPATCHED:
-                self.ledger.verify(op_id, healthy=healthy, evidence=evidence, actor=actor)
             if healthy:
                 jump = self._index_of(step.on_recovered) if step.on_recovered else None
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), jump
@@ -597,6 +673,45 @@ class CrewRunner:
 
     def _index_of(self, step_name: str) -> int:
         return next(i for i, s in enumerate(self.crew.workflow) if s.step == step_name)
+
+
+def check_expectations(report: CrewRunReport, scenario: Scenario, auto_approve: bool) -> list[str]:
+    """Compare a report with the scenario's ``expect`` block. Returns human-readable failures."""
+    e = scenario.expect
+    failures: list[str] = []
+
+    def eq(key: str, actual: int) -> None:
+        if key in e and actual != e[key]:
+            failures.append(f"{key}: expected {e[key]}, got {actual}")
+
+    def at_least(key: str, actual: int) -> None:
+        if key in e and actual < e[key]:
+            failures.append(f"{key}: expected >= {e[key]}, got {actual}")
+
+    def at_most(key: str, actual: int) -> None:
+        if key in e and actual > e[key]:
+            failures.append(f"{key}: expected <= {e[key]}, got {actual}")
+
+    eq("incidents", len(report.incidents))
+    at_least("incidents_at_least", len(report.incidents))
+    eq("duplicate_deliveries", report.duplicate_deliveries)
+    eq("evidence_only_updates", report.evidence_only_updates)
+    at_most("investigations_at_most", report.investigations_requested)
+    at_least("investigations_at_least", report.investigations_requested)
+    if auto_approve:
+        at_least("operations_at_least", report.ledger.get("operations", 0))
+        eq("resolved_with_auto_approve", report.resolved)
+        at_least("resolved_with_auto_approve_at_least", report.resolved)
+        policy_approvals = sum(
+            1 for inc in report.incidents for s in inc.steps
+            if s.action is StepAction.AUTHORIZE and str(s.detail.get("authorized_by", "")).startswith("policy:")
+        )
+        at_least("policy_approved_at_least", policy_approvals)
+    else:
+        eq("held_without_auto_approve", report.held)
+        at_least("held_without_auto_approve_at_least", report.held)
+        eq("resolved_without_auto_approve", report.resolved)
+    return failures
 
 
 def run_crew(crew: Crew, scenario: Scenario, auto_approve: bool = False, executor: RoleExecutor | None = None) -> CrewRunReport:

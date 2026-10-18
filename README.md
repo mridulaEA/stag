@@ -8,6 +8,8 @@ Named after the concept of **Stream-Triggered Augmented Generation** — where t
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python) ![FastAPI](https://img.shields.io/badge/FastAPI-0.109-green?logo=fastapi) ![React](https://img.shields.io/badge/React-18.3-blue?logo=react) ![License](https://img.shields.io/badge/License-MIT-green) ![Skills](https://img.shields.io/badge/Agent%20Skills-Claude%20Code%20%7C%20Codex%20%7C%20Cursor-purple)
 
+> **Status:** STAG is a local development and simulation project. The API has **no authentication**, control state is in-memory, and crew runs are simulations with fixture verdicts. See [`docs/STATUS.md`](docs/STATUS.md) for what is implemented vs simulated vs planned and [`docs/review/FINDINGS.md`](docs/review/FINDINGS.md) for the review ledger. Do not connect production mutation tools or sensitive multi-tenant data yet.
+>
 > **New in 0.3:** a [TechOps backbone](#techops-deterministic-backbone-bounded-agents) (dedup, incident lifecycle, bounded investigation, retry-safe actions), a [skill pack](#agent-skills-claude-code-codex-cursor) that works in Claude Code, Codex and Cursor, and eight ready-made [crews](#crews-ready-made-teams-per-use-case) (incident triage, problem management, release management, AI automation, customer care, log management, data ops, security governance) that run end-to-end. Start with [`crews/README.md`](crews/README.md).
 
 ---
@@ -60,7 +62,7 @@ Traditional Retrieval-Augmented Generation is **reactive** — it sits idle unti
 │         │                         │                              │
 │         │  ┌───────┐ ┌────────┐  │                              │
 │         │  │Vector │ │ Graph  │  │                              │
-│         │  │ChromaDB│ │NetworkX│  │                              │
+│         │  │ NumPy  │ │NetworkX│  │                              │
 │         │  └───┬───┘ └───┬────┘  │                              │
 │         │      │    RRF  │       │                              │
 │         │  ┌───┴────┐    │       │                              │
@@ -130,7 +132,7 @@ Traditional Retrieval-Augmented Generation is **reactive** — it sits idle unti
 - **REST**: `/api/techops/incidents`, `/api/techops/investigations`, `/api/techops/actions`
 
 ### Hybrid Knowledge Store
-- **Vector Store (ChromaDB)**: Semantic similarity search with sentence-transformer embeddings
+- **Vector Store (in-memory NumPy cosine)**: Semantic similarity search with sentence-transformer embeddings (swap for Qdrant/Weaviate/ChromaDB in production)
 - **Graph Store (NetworkX)**: Dynamic knowledge graph that extracts entities (users, tools, departments, data types) and relationships from events, supports relationship-aware retrieval
 - **Sparse Store (BM25)**: Keyword-based retrieval for exact matches on tool names, policy IDs, usernames
 - **Reciprocal Rank Fusion**: Merges results with configurable weights (default: vector 40%, graph 35%, sparse 25%)
@@ -233,7 +235,7 @@ stag/
 │   │   ├── engine.py             # Rule evaluation engine
 │   │   └── rules.py              # 5 built-in rule types + registry
 │   ├── knowledge/                 # Knowledge stores
-│   │   ├── vector_store.py       # ChromaDB vector search
+│   │   ├── vector_store.py       # In-memory NumPy cosine vector search
 │   │   ├── graph_store.py        # NetworkX knowledge graph
 │   │   ├── sparse_store.py       # BM25 sparse retrieval
 │   │   └── hybrid_retriever.py   # RRF fusion across all three
@@ -312,7 +314,7 @@ All configuration is via environment variables (or `.env` file):
 | `KAFKA_TOPIC` | `stag-events` | Kafka topic to consume |
 | `KAFKA_GROUP_ID` | `stag-consumer` | Kafka consumer group ID |
 | **Storage** | | |
-| `CHROMA_PERSIST_DIR` | `./data/chroma` | ChromaDB persistence directory |
+| `CHROMA_PERSIST_DIR` | `./data/chroma` | Vector index persistence directory (NumPy files; name kept for compatibility) |
 | `GRAPH_PERSIST_PATH` | `./data/graph.json` | Knowledge graph persistence file |
 | **Trigger** | | |
 | `TRIGGER_EVAL_INTERVAL` | `2.0` | Trigger evaluation interval (seconds) |
@@ -342,7 +344,7 @@ All configuration is via environment variables (or `.env` file):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/health` | Health check |
+| `GET` | `/api/health` | Health with component readiness (`ok` / `degraded`) |
 | `GET` | `/api/stats` | Pipeline statistics |
 | `GET` | `/api/events?limit=50` | Recent stream events |
 | `POST` | `/api/events` | Inject an event |
@@ -361,10 +363,11 @@ All configuration is via environment variables (or `.env` file):
 | `GET` | `/api/techops/investigations` | Investigation requests (material changes) |
 | `GET` | `/api/techops/actions` | Action ledger |
 | `POST` | `/api/techops/actions/prepare` | Prepare a remediation operation (deterministic id) |
-| `POST` | `/api/techops/actions/{op}/authorize` | Bind an approval to target + incident version |
-| `POST` | `/api/techops/actions/{op}/dispatch?current_incident_version=` | Revalidate staleness, then dispatch |
-| `POST` | `/api/techops/actions/{op}/outcome-unknown` | Lost response → reconciling |
-| `POST` | `/api/techops/actions/{op}/reconcile?target_state_observed=` | Resolve from the target's state |
+| `POST` | `/api/techops/actions/{op}/authorize` | Bind an approval to the exact terms and the incident's *current* version (server-derived) |
+| `POST` | `/api/techops/actions/{op}/dispatch` | Ledger revalidates freshness from server state, then dispatches |
+| `POST` | `/api/techops/actions/{op}/outcome-unknown` | Lost response → reconciling (not dispatchable) |
+| `POST` | `/api/techops/actions/{op}/reconcile?target_state_observed=` | APPLIED if the target shows the effect, else RETRY_READY |
+| `POST` | `/api/techops/actions/{op}/applied` | Destination confirmed application; verification still required |
 | `POST` | `/api/techops/actions/{op}/verify` | Record independent recovery verification |
 
 ### WebSocket
@@ -443,7 +446,8 @@ findings = run.finish(my_findings)               # partial + escalate when limit
 ledger = ActionLedger()
 op = ledger.prepare(decision.incident_id, "restart_component", "checkout-api", {"replicas": 2})
 ledger.authorize(op.operation_id, actor="oncall@acme", incident_version=coord.get_incident(op.incident_id).version)
-ledger.dispatch(op.operation_id)                 # retries reuse op.operation_id
+ledger.dispatch(op.operation_id, current_incident_version=incident.version)  # ledger decides freshness
+# lost response? ledger.mark_outcome_unknown(...) → reconcile from the target → APPLIED or RETRY_READY
 ```
 
 Design summary: [`docs/techops/README.md`](docs/techops/README.md). Tests mirroring the
@@ -473,9 +477,10 @@ python -m stag.crews run techops-incident-triage --auto-approve   # simulate the
 python -m stag.crews run-all --auto-approve                       # check every crew end-to-end
 ```
 
-Every crew run reports **model calls avoided** (duplicates + evidence-only updates), incidents
-resolved vs held, operations with approvals and verification, notifications with provenance and
-draft artifacts. The dashboard's **Crews** tab shows the catalog and runs dry runs; the API exposes
+Every crew run is a **simulation** (`mode: simulation`): verdicts come from scenario fixtures,
+actions change ledger records only, approvals are simulated flags. A run reports investigations
+suppressed by dedup and evidence-only updates, incidents resolved vs held, operations with
+approvals and verification, notifications with provenance and draft artifacts. The dashboard's **Crews** tab shows the catalog and runs dry runs; the API exposes
 `GET /api/crews` and `POST /api/crews/{name}/run`. Author your own with the `stag-crew-authoring`
 skill — see [`crews/README.md`](crews/README.md) and [`docs/crews/README.md`](docs/crews/README.md).
 

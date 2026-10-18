@@ -78,8 +78,9 @@ class VectorStore:
         text = event.text
         embedding = self._embed(text)
 
-        self._documents[event.id] = {
-            "id": event.id,
+        self._documents[event.doc_key] = {
+            "id": event.doc_key,
+            "event_id": event.id,
             "text": text,
             "metadata": {
                 "source": event.source,
@@ -89,7 +90,7 @@ class VectorStore:
                 **{k: str(v) for k, v in event.payload.items() if isinstance(v, (str, int, float, bool))},
             },
         }
-        self._embeddings[event.id] = embedding
+        self._embeddings[event.doc_key] = embedding
 
         # Evict oldest if over capacity
         while len(self._documents) > self.max_documents:

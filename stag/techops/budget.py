@@ -9,6 +9,7 @@ an uncertain or timed-out request is reconciled rather than treated as free.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
@@ -16,6 +17,17 @@ from pydantic import BaseModel, Field
 
 class BudgetExhausted(Exception):
     """Raised when a reservation would exceed the available allocation."""
+
+
+def _amount(value: float, what: str) -> float:
+    """Validate a monetary/credit amount: finite, non-negative, numeric."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{what} must be numeric") from e
+    if isinstance(value, bool) or not math.isfinite(amount) or amount < 0:
+        raise ValueError(f"{what} must be a finite non-negative number, got {value!r}")
+    return amount
 
 
 class Reservation(BaseModel):
@@ -34,10 +46,8 @@ class BudgetLedger:
     """
 
     def __init__(self, allocation: float, name: str = "default") -> None:
-        if allocation < 0:
-            raise ValueError("allocation must be non-negative")
         self.name = name
-        self.allocation = float(allocation)
+        self.allocation = _amount(allocation, "allocation")
         self.spent = 0.0
         self._reservations: dict[str, Reservation] = {}
 
@@ -51,11 +61,12 @@ class BudgetLedger:
 
     def reserve(self, ref: str, amount: float) -> Reservation:
         """Reserve a conservative allowance for a bounded call or task before dispatch."""
-        if amount < 0:
-            raise ValueError("amount must be non-negative")
+        amount = _amount(amount, "reservation amount")
         existing = self._reservations.get(ref)
-        if existing and not existing.settled:
-            return existing  # idempotent: retrying the reservation does not double-reserve
+        if existing is not None:
+            if not existing.settled:
+                return existing  # idempotent: retrying the reservation does not double-reserve
+            raise ValueError(f"reservation '{ref}' is already settled; a new attempt needs a new ref")
         if amount > self.available:
             raise BudgetExhausted(
                 f"budget '{self.name}': requested {amount:.2f}, available {self.available:.2f}"
@@ -66,12 +77,13 @@ class BudgetLedger:
 
     def settle(self, ref: str, actual: float) -> Reservation:
         """Record actual usage and release the unused part of the reservation."""
+        actual = _amount(actual, "settled usage")
         reservation = self._reservations[ref]
         if reservation.settled:
-            return reservation
+            return reservation  # idempotent settlement
         reservation.settled = True
-        reservation.actual = float(actual)
-        self.spent += float(actual)
+        reservation.actual = actual
+        self.spent += actual
         return reservation
 
     def release(self, ref: str) -> None:
@@ -85,7 +97,7 @@ class BudgetLedger:
         """Change the allocation. Requires an explicit authorizer; agents never call this."""
         if not authorized_by:
             raise ValueError("an allocation change requires an authorizer")
-        self.allocation = float(allocation)
+        self.allocation = _amount(allocation, "allocation")
 
     @property
     def stats(self) -> dict:

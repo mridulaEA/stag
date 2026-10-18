@@ -42,8 +42,9 @@ class SparseStore:
 
     async def add_event(self, event: StreamEvent) -> None:
         """Add a stream event to the BM25 index."""
-        self._documents[event.id] = {
-            "id": event.id,
+        self._documents[event.doc_key] = {
+            "id": event.doc_key,
+            "event_id": event.id,
             "text": event.text,
             "metadata": {
                 "source": event.source,

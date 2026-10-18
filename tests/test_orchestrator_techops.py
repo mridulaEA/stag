@@ -103,7 +103,9 @@ async def test_without_coordinator_every_trigger_generates():
     for _ in range(3):
         await orch.inject_event(_event())
     assert generator.calls == 3
-    assert all(m["type"] == "insight" for m in messages)
+    types = [m["type"] for m in messages]
+    # deterministic detection is emitted before enrichment, then the insight
+    assert types == ["trigger", "insight"] * 3
 
 
 async def test_with_coordinator_repeated_symptoms_skip_llm():
@@ -116,14 +118,61 @@ async def test_with_coordinator_repeated_symptoms_skip_llm():
 
     assert generator.calls == 1
     types = [m["type"] for m in messages]
-    assert types == ["insight", "incident_update", "incident_update", "incident_update"]
-    assert messages[0]["output"]["incident_id"] is not None
-    assert messages[0]["output"]["material_change"] == "new_incident"
-    assert messages[1]["decision"]["duplicate"] is True
-    assert messages[2]["decision"]["material_change"] == "none"
+    # new incident: trigger + insight; exact redelivery: incident_update with no trigger evaluation;
+    # two repeated symptoms: trigger + incident_update (no LLM call)
+    assert types == ["trigger", "insight", "incident_update", "trigger", "incident_update", "trigger", "incident_update"]
+    insight = next(m for m in messages if m["type"] == "insight")
+    assert insight["output"]["incident_id"] is not None
+    assert insight["output"]["material_change"] == "new_incident"
+    assert messages[2]["decision"]["duplicate"] is True and messages[2]["trigger"] is None
+    assert messages[4]["decision"]["material_change"] == "none"
 
     stats = orch.stats
-    assert stats["triggers_fired"] == 4
+    assert stats["triggers_fired"] == 3  # the redelivery never reached the trigger engine
     assert stats["investigations_suppressed"] == 3
     assert stats["techops"]["observations_accepted"] == 3
     assert stats["techops"]["duplicate_deliveries"] == 1
+
+
+async def test_duplicates_are_not_indexed_or_counted_by_stateful_rules():
+    from stag.triggers import RuleRegistry
+    from stag.triggers.rules import FrequencyRule
+
+    registry = RuleRegistry()
+    registry.register(FrequencyRule("burst", window_seconds=60, max_events=2, group_by="user"))
+    retriever, generator = StubRetriever(), StubGenerator()
+    orch = PipelineOrchestrator(
+        stream_source=StubStream(), trigger_engine=__import__("stag.triggers", fromlist=["TriggerEngine"]).TriggerEngine(registry),
+        retriever=retriever, generator=generator, settings=Settings(), coordinator=IncidentCoordinator(),
+    )
+    ev = _event(severity=Severity.LOW, payload={"user": "u1"})
+    for _ in range(4):
+        await orch.inject_event(ev)  # same identity delivered four times
+    assert retriever.added == 1, "duplicates must not be indexed"
+    assert orch.stats["triggers_fired"] == 0, "duplicates must not inflate frequency rules"
+    assert generator.calls == 0
+
+
+async def test_generation_failure_preserves_detection():
+    class FailingGenerator(StubGenerator):
+        async def generate(self, event, trigger, retrieval):
+            raise RuntimeError("provider down")
+
+    orch, _, messages = _orchestrator(None)
+    orch.generator = FailingGenerator()
+    await orch.inject_event(_event())
+    types = [m["type"] for m in messages]
+    assert types == ["trigger", "insight"]
+    assert messages[1]["output"]["insight"]["generation_mode"] == "degraded"
+    assert "provider down" in messages[1]["output"]["insight"]["degraded_reason"]
+
+
+async def test_start_stop_are_idempotent_and_own_the_task():
+    orch, _, _ = _orchestrator(None)
+    await orch.start()
+    first = orch._task
+    await orch.start()
+    assert orch._task is first, "a second start must not spawn a second processing loop"
+    await orch.stop()
+    assert orch._task is None and not orch._running
+    await orch.stop()  # no error on repeated stop

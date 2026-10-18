@@ -77,6 +77,14 @@ cd frontend && npm install && npm run dev  # dashboard at :5173
 - Commit messages: imperative, scoped (`techops: ...`, `skills: ...`, `frontend: ...`).
 - Do not commit `.env`, `data/`, `frontend/dist/`.
 
+## Status and review ledger
+
+STAG is a local development and simulation project: no API authentication, in-memory control
+state, simulated crew runs. `docs/STATUS.md` says what is implemented vs simulated vs planned;
+`docs/review/FINDINGS.md` tracks the engineering-review findings (R01–R32) and their status.
+When you change the ledger, coordinator, runner or installer, add a regression test to
+`tests/test_review_regressions.py` or the module's test file and update the ledger row.
+
 ## Community
 
 See `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` and `docs/community/README.md`. Skill proposals use
