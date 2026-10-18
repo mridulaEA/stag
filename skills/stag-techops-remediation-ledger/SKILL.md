@@ -69,7 +69,14 @@ preconditions and staleness.
    If the destination offers no reliable idempotency or queryable operation id, you cannot
    manufacture exactly-once with a local flag: stop blind retries and escalate.
 5. **Verify** — hand off to `stag-techops-recovery-verification`. `verify(op, healthy, evidence)`
-   records the independent outcome. Missing telemetry is unknown, not healthy.
+   needs a `VerificationResult` (`source`, `window`, `signals`); an empty claim or an integer
+   verdict is rejected. The result is also bound to the incident at its current evidence version
+   (`coordinator.record_verification`), and only a current successful result allows `RESOLVED`.
+   Missing telemetry is unknown, not healthy. Simulated evidence is refused by a live coordinator.
+6. **Never edit a record outside the ledger.** Terms carry an integrity digest; a record whose
+   parameters or preconditions were altered after review is refused by authorize, dispatch and
+   verify. Retries share one cumulative attempt ceiling across re-approvals; raising it is an
+   audited `extend_retry_budget` call, never a side effect of approving again.
 6. **Record incident transitions** — `ACTION_PROPOSED → AUTHORIZED/HELD/REJECTED → EXECUTING →
    VERIFYING → RESOLVED` via the coordinator, each with actor and reason.
 

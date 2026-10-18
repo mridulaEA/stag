@@ -51,6 +51,7 @@ from stag.techops import (
     LimitExceeded,
     PermissionDenied,
     SignalKey,
+    VerificationResult,
 )
 from stag.techops.assignment import (
     AssignmentLimits,
@@ -327,7 +328,11 @@ class CrewRunner:
 
         registry = RuleRegistry.from_specs([t.model_dump() for t in crew.triggers]) if crew.triggers else RuleRegistry.default()
         self.engine = TriggerEngine(registry)
-        self.coordinator = IncidentCoordinator(signal_key_fn=self._signal_key, **crew.coordinator)
+        # Simulation mode: live correlation semantics plus acceptance of *simulated* verification
+        # evidence (fixtures). A live coordinator refuses simulated evidence.
+        self.coordinator = IncidentCoordinator(
+            signal_key_fn=self._signal_key, processing_mode="simulation", **crew.coordinator
+        )
         self.ledger = ActionLedger()
         self.budget = BudgetLedger(crew.budget_allocation, name=crew.name)
         self._first_event: dict[str, StreamEvent] = {}
@@ -426,7 +431,7 @@ class CrewRunner:
     def run_workflow(self, incident: Incident) -> IncidentRun:
         run = IncidentRun(
             incident_id=incident.id,
-            signal_key=incident.signal_key,
+            signal_key=str(incident.attributes.get("signal_display", incident.signal_key)),
             severity=incident.severity.value,
             final_state=incident.state.value,
         )
@@ -451,7 +456,7 @@ class CrewRunner:
                 run.halted_at, run.halt_reason = step.step, f"error: {e}"
                 break
             run.steps.append(record)
-            if record.status in ("held", "awaiting"):
+            if record.status in ("held", "awaiting", "failed"):
                 run.halted_at, run.halt_reason = step.step, record.detail.get("reason", record.status)
                 break
             if jump is not None:
@@ -494,7 +499,11 @@ class CrewRunner:
         if step.action is StepAction.TRANSITION:
             if incident.state is step.to:
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"reason": f"already {step.to.value}"}), None
-            self.coordinator.transition(incident.id, step.to, actor=actor, reason=step.description or step.step)
+            try:
+                self.coordinator.transition(incident.id, step.to, actor=actor, reason=step.description or step.step)
+            except InvalidTransition as e:
+                # e.g. a workflow that tries to RESOLVE without a current successful verification
+                return StepRecord(step=step.step, action=step.action, role=step.role, status="failed", detail={"to": step.to.value, "reason": str(e)}), None
             return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail={"to": step.to.value}), None
 
         if step.action is StepAction.INVESTIGATE:
@@ -547,14 +556,19 @@ class CrewRunner:
                     "proposed_next_step": findings.proposed_next_step,
                 }
             )
-            if findings.partial:
-                # Partial or escalated findings never advance to proposal/dispatch on their own.
-                self._ensure(incident, IncidentState.HELD, actor, "partial findings; human review required")
-                detail["reason"] = (
-                    "partial findings (missing: "
-                    + ", ".join(findings.missing_required(assignment)) + "); escalated for human review"
-                )
+            if findings.partial or findings.escalate:
+                # Partial *or* escalated findings never advance to proposal/dispatch on their own.
+                # Continuing requires a separately recorded human review decision, not auto_approve.
+                why = []
+                if findings.partial:
+                    why.append("partial findings (missing: " + ", ".join(findings.missing_required(assignment)) + ")")
+                if findings.escalate:
+                    why.append("investigator requested escalation")
+                self._ensure(incident, IncidentState.HELD, actor, "; ".join(why) + "; human review required")
+                detail["reason"] = "; ".join(why) + "; held for human review"
+                detail["disposition"] = "escalated" if findings.escalate else "partial"
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="held", detail=detail), None
+            detail["disposition"] = "complete"
             return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), None
 
         if step.action is StepAction.PROPOSE_ACTION:
@@ -625,23 +639,34 @@ class CrewRunner:
             op_id = context["operation_ids"][-1] if context["operation_ids"] else None
             record = self.ledger.get(op_id) if op_id else None
             hints = self._verification_hints
+            display = str(incident.attributes.get("signal_display", incident.signal_key))
             hint = hints.get(
-                f"{incident.signal_key}#{context['verifications']}",
-                hints.get(incident.signal_key, hints.get("default", Verdict.UNKNOWN)),
+                f"{display}#{context['verifications']}",
+                hints.get(display, hints.get("default", Verdict.UNKNOWN)),
             )
             healthy, evidence = self.executor.verify(self.crew, incident, record, hint)
-            if healthy not in (True, False, None):
-                healthy = None  # an executor returning anything else is treated as unknown
+            # A verdict is a real bool or None. Integers, strings and other truthy values are unknown.
+            if not (healthy is None or type(healthy) is bool):
+                healthy = None
+                evidence = {**(evidence or {}), "rejected_verdict": "executor returned a non-boolean verdict"}
+            try:
+                result = VerificationResult(**{**dict(evidence or {}), "healthy": healthy})
+            except Exception as e:  # unvalidated evidence never resolves anything
+                healthy = None
+                result = None
+                evidence = {**(evidence or {}), "rejected_evidence": str(e)[:200]}
             verdict = {True: "healthy", False: "not_recovered", None: "unknown"}[healthy]
             detail.update({"operation_id": op_id, "verdict": verdict, "evidence": evidence})
             detail["implicit_transitions"] = self._ensure(incident, IncidentState.VERIFYING, actor, step.step)
-            if record is not None and record.state in (ActionState.DISPATCHED, ActionState.APPLIED):
-                self.ledger.verify(op_id, healthy=healthy, evidence=evidence, actor=actor)
+            if result is not None and record is not None and record.state in (ActionState.DISPATCHED, ActionState.APPLIED):
+                self.ledger.verify(op_id, healthy=healthy, evidence=result, actor=actor)
             if healthy is None:
                 return StepRecord(
                     step=step.step, action=step.action, role=step.role, status="awaiting",
-                    detail={**detail, "reason": "no verification evidence (missing fixture or telemetry); recovery unknown — not resolving"},
+                    detail={**detail, "reason": "no validated verification evidence (missing fixture, bad verdict or telemetry); recovery unknown — not resolving"},
                 ), None
+            # Bind the result to the incident at its current evidence version; RESOLVED needs it.
+            self.coordinator.record_verification(incident.id, result, operation_id=op_id, verified_by=actor)
             if healthy:
                 jump = self._index_of(step.on_recovered) if step.on_recovered else None
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), jump

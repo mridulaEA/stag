@@ -59,6 +59,14 @@ function InsightCard({ insight, defaultExpanded = false }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
             <SeverityBadge severity={generated.severity} />
+            {generated.generation_mode && generated.generation_mode !== 'llm' && (
+              <span
+                className={`px-1.5 py-0.5 rounded text-[10px] uppercase border ${generated.generation_mode === 'degraded' ? 'border-red-500/40 text-red-300' : 'border-gray-600 text-gray-400'}`}
+                title={generated.degraded_reason || 'template output (no model)'}
+              >
+                {generated.generation_mode}
+              </span>
+            )}
             <span className="text-xs text-gray-500">{trigger.rule_name}</span>
             <span className="text-xs text-gray-600">{new Date(event.timestamp).toLocaleTimeString()}</span>
           </div>

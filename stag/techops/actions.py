@@ -23,6 +23,7 @@ Rules the ledger enforces rather than documents:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -76,6 +77,26 @@ class RetryBudgetExceeded(InvalidActionTransition):
     pass
 
 
+class IntegrityError(InvalidActionTransition):
+    """The record's terms no longer match the terms that were reviewed and approved."""
+
+
+class VerificationResult(BaseModel):
+    """A validated verification claim. Empty or unsubstantiated evidence does not validate.
+
+    ``simulated`` marks scenario fixtures; a live coordinator refuses them.
+    """
+
+    healthy: bool | None
+    source: str = Field(min_length=1, max_length=200)
+    window: str = Field(min_length=1, max_length=200)
+    signals: list[str] = Field(min_length=1, max_length=64)
+    target: str | None = Field(default=None, max_length=200)
+    observed_at: datetime = Field(default_factory=_now)
+    simulated: bool = False
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class ActionEvent(BaseModel):
     from_state: ActionState
     to_state: ActionState
@@ -93,6 +114,7 @@ class ActionRecord(BaseModel):
     policy_version: str = "unversioned"
     preconditions: list[str] = Field(default_factory=list)
     terms_hash: str = ""
+    retry_budget_extension: int = 0
     state: ActionState = ActionState.PREPARED
     authorized_by: str | None = None
     authorized_at_incident_version: int | None = None
@@ -160,11 +182,44 @@ class ActionLedger:
         """
         max_staleness_versions: incident versions that may pass between authorization and dispatch
             before re-approval is required. 0 means any change makes the approval stale.
-        max_retries: explicit retries allowed after a reconciliation proved the effect absent.
+        max_retries: explicit retries allowed after a reconciliation proved the effect absent. The
+            ceiling is cumulative for the operation: re-approval does not replenish it.
         """
+        if int(max_staleness_versions) < 0 or int(max_retries) < 0:
+            raise ValueError("max_staleness_versions and max_retries must be >= 0")
         self._records: dict[str, ActionRecord] = {}
-        self.max_staleness_versions = max_staleness_versions
-        self.max_retries = max_retries
+        self.max_staleness_versions = int(max_staleness_versions)
+        self.max_retries = int(max_retries)
+
+    # ----------------------------------------------------------------- integrity
+
+    @staticmethod
+    def _check_integrity(record: ActionRecord) -> None:
+        """Recompute the terms digest; any drift means the record was altered outside the ledger."""
+        current = ActionRecord.terms(
+            record.incident_id, record.plan_step, record.target, record.parameters,
+            record.policy_version, record.preconditions,
+        )
+        if current != record.terms_hash:
+            raise IntegrityError(
+                f"{record.operation_id}: operation terms were modified after review; "
+                "changing target, parameters, policy or preconditions requires a new operation"
+            )
+
+    def _attempt_ceiling(self, record: ActionRecord) -> int:
+        return 1 + self.max_retries + record.retry_budget_extension
+
+    def extend_retry_budget(self, operation_id: str, by: int, authorized_by: str, note: str = "") -> ActionRecord:
+        """Audited extension of one operation's retry allowance. Never implicit."""
+        if by < 1 or not authorized_by:
+            raise ValueError("a retry-budget extension needs a positive amount and an authorizer")
+        record = self._record(operation_id)
+        record.retry_budget_extension += int(by)
+        record.history.append(
+            ActionEvent(from_state=record.state, to_state=record.state, actor=authorized_by,
+                        note=note or f"retry budget extended by {by}")
+        )
+        return record
 
     # ----------------------------------------------------------------- lifecycle
 
@@ -178,7 +233,7 @@ class ActionLedger:
         preconditions: list[str] | None = None,
     ) -> ActionRecord:
         """Create (or return the existing) operation record for these exact terms."""
-        parameters = parameters or {}
+        parameters = copy.deepcopy(parameters or {})  # detached from the caller's object
         preconditions = list(preconditions or [])
         terms = ActionRecord.terms(incident_id, plan_step, target, parameters, policy_version, preconditions)
         op_id = "OP-" + terms[:12]
@@ -204,7 +259,8 @@ class ActionLedger:
         """Bind an explicit approval to the exact terms and the incident evidence version."""
         if not actor:
             raise ValueError("authorization requires an actor")
-        record = self.get(operation_id)
+        record = self._record(operation_id)
+        self._check_integrity(record)
         record._move(ActionState.AUTHORIZED, actor, note or "approved")
         record.authorized_by = actor
         record.authorized_at_incident_version = int(incident_version)
@@ -212,13 +268,13 @@ class ActionLedger:
         return record
 
     def reject(self, operation_id: str, actor: str, note: str = "") -> ActionRecord:
-        record = self.get(operation_id)
+        record = self._record(operation_id)
         record._move(ActionState.REJECTED, actor, note)
         return record
 
     def revalidate(self, operation_id: str, current_incident_version: int, actor: str = "system") -> ActionRecord:
         """Before dispatch, confirm the approval is not stale relative to the incident's evidence."""
-        record = self.get(operation_id)
+        record = self._record(operation_id)
         if record.state not in DISPATCHABLE_STATES:
             return record
         authorized_at = record.authorized_at_incident_version
@@ -235,7 +291,8 @@ class ActionLedger:
 
         When ``current_incident_version`` is given, freshness is revalidated first.
         """
-        record = self.get(operation_id)
+        record = self._record(operation_id)
+        self._check_integrity(record)  # before any state change or attempt count
         if current_incident_version is not None:
             self.revalidate(operation_id, current_incident_version, actor=actor)
         if record.state not in DISPATCHABLE_STATES:
@@ -243,8 +300,11 @@ class ActionLedger:
                 f"{operation_id}: cannot dispatch from {record.state.value}; "
                 "only authorized or retry_ready operations are dispatchable"
             )
-        if record.state is ActionState.RETRY_READY and record.dispatch_attempts >= 1 + self.max_retries:
-            raise RetryBudgetExceeded(f"{operation_id}: retry budget ({self.max_retries}) exhausted")
+        if record.dispatch_attempts >= self._attempt_ceiling(record):
+            raise RetryBudgetExceeded(
+                f"{operation_id}: cumulative dispatch ceiling ({self._attempt_ceiling(record)}) reached; "
+                "re-approval does not replenish it — record an explicit retry-budget extension"
+            )
         note = "retry after reconciliation proved the effect absent" if record.state is ActionState.RETRY_READY else "dispatched"
         record._move(ActionState.DISPATCHED, actor, note)
         record.dispatch_attempts += 1
@@ -253,7 +313,8 @@ class ActionLedger:
 
     def mark_applied(self, operation_id: str, actor: str = "executor", receipt: dict[str, Any] | None = None) -> ActionRecord:
         """The destination confirmed the change was applied. Not recovery: verification still required."""
-        record = self.get(operation_id)
+        record = self._record(operation_id)
+        self._check_integrity(record)
         record._move(ActionState.APPLIED, actor, "destination confirmed application")
         if receipt:
             record.verification["application_receipt"] = receipt
@@ -261,7 +322,7 @@ class ActionLedger:
 
     def mark_outcome_unknown(self, operation_id: str, actor: str = "executor", note: str = "") -> ActionRecord:
         """The response was lost or timed out. Not a failure, not a success: reconcile."""
-        record = self.get(operation_id)
+        record = self._record(operation_id)
         record._move(ActionState.OUTCOME_UNKNOWN, actor, note or "response lost or timed out")
         record._move(ActionState.RECONCILING, "system", "reconciliation started")
         return record
@@ -274,7 +335,7 @@ class ActionLedger:
         Observed → APPLIED (verification still required). Absent → RETRY_READY; the retry itself is
         a separate, explicit ``dispatch`` that re-checks freshness and the retry budget.
         """
-        record = self.get(operation_id)
+        record = self._record(operation_id)
         if record.state is not ActionState.RECONCILING:
             raise InvalidActionTransition(f"{operation_id} is not reconciling")
         if target_state_observed:
@@ -284,42 +345,63 @@ class ActionLedger:
         return record
 
     def verify(
-        self, operation_id: str, healthy: bool | None, evidence: dict[str, Any], actor: str = "verifier"
-    ) -> ActionRecord:
+        self,
+        operation_id: str,
+        healthy: bool | None,
+        evidence: VerificationResult | dict[str, Any],
+        actor: str = "verifier",
+    ) -> VerificationResult:
         """Record independent verification of the externally observable outcome.
 
-        ``healthy=None`` (unknown / missing telemetry) records the attempt and leaves the state
-        unchanged. The transition is validated *before* any field is written.
+        ``evidence`` must validate as a :class:`VerificationResult` (source, window, signals);
+        an empty mapping or a bare boolean claim is rejected before anything is written. ``healthy``
+        must be a real bool or None; integers are not accepted. The transition is validated before
+        any field is written. Returns the validated result.
         """
-        record = self.get(operation_id)
+        if not (healthy is None or type(healthy) is bool):
+            raise ValueError("healthy must be True, False or None (unknown); integers are not verdicts")
+        result = evidence if isinstance(evidence, VerificationResult) else VerificationResult(
+            **{**dict(evidence), "healthy": healthy}
+        )
+        if result.healthy is not healthy:
+            result = result.model_copy(update={"healthy": healthy})
+        record = self._record(operation_id)
+        self._check_integrity(record)
         if healthy is None:
             if record.is_terminal:
                 raise InvalidActionTransition(f"{operation_id} is terminal ({record.state.value})")
             attempts = record.verification.setdefault("unknown_verdicts", [])
-            attempts.append({**dict(evidence), "at": _now().isoformat()})
-            return record
+            attempts.append(result.model_dump(mode="json"))
+            return result
         target = ActionState.VERIFIED if healthy else ActionState.FAILED
         if not record._can(target):
             raise InvalidActionTransition(f"{operation_id}: {record.state.value} → {target.value} is not permitted")
-        reserved = {"healthy", "verified_at", "verified_by"}
-        clean = {k: v for k, v in dict(evidence).items() if k not in reserved}
         record.verification = {
             **{k: v for k, v in record.verification.items() if k in ("application_receipt", "unknown_verdicts")},
-            **clean,
+            **result.model_dump(mode="json"),
             "healthy": bool(healthy),
             "verified_at": _now().isoformat(),
             "verified_by": actor,
         }
         record._move(target, actor, "health checks passed over observation window" if healthy else "health checks did not confirm recovery")
-        return record
+        return result
 
     # ----------------------------------------------------------------- accessors
 
-    def get(self, operation_id: str) -> ActionRecord:
+    def _record(self, operation_id: str) -> ActionRecord:
         try:
             return self._records[operation_id]
         except KeyError:
             raise KeyError(f"unknown operation {operation_id}") from None
+
+    def get(self, operation_id: str) -> ActionRecord:
+        """The live record. Mutating it outside ledger commands breaks its integrity digest and
+        every later command (authorize, dispatch, verify) refuses it."""
+        return self._record(operation_id)
+
+    def view(self, operation_id: str) -> ActionRecord:
+        """A detached, read-only copy for API responses and reports."""
+        return self._record(operation_id).model_copy(deep=True)
 
     def for_incident(self, incident_id: str) -> list[ActionRecord]:
         return [r for r in self._records.values() if r.incident_id == incident_id]

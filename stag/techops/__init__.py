@@ -20,8 +20,10 @@ from stag.techops.actions import (
     ActionLedger,
     ActionRecord,
     ActionState,
+    IntegrityError,
     InvalidActionTransition,
     RetryBudgetExceeded,
+    VerificationResult,
 )
 from stag.techops.assignment import (
     AssignmentLimits,
@@ -48,6 +50,7 @@ from stag.techops.incident import (
     InvalidTransition,
     MaterialChange,
     Transition,
+    VerificationRecord,
 )
 
 __all__ = [
@@ -75,7 +78,10 @@ __all__ = [
     "ActionRecord",
     "ActionState",
     "InvalidActionTransition",
+    "IntegrityError",
     "RetryBudgetExceeded",
+    "VerificationResult",
+    "VerificationRecord",
     "RegistrationResult",
     "envelope_hash",
     "BudgetExhausted",

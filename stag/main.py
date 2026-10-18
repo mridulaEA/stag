@@ -85,6 +85,7 @@ async def lifespan(app: FastAPI):
             investigation_cooldown_seconds=settings.techops_investigation_cooldown_seconds,
             recurrence_window_seconds=settings.techops_recurrence_window_seconds,
             dedup_retention=settings.techops_dedup_retention,
+            processing_mode=settings.techops_processing_mode,
         )
         logger.info("techops.coordinator_enabled", tenant=settings.techops_tenant)
 

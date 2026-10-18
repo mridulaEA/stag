@@ -28,6 +28,8 @@ from stag.techops import (
     LimitExceeded,
     MaterialChange,
     PermissionDenied,
+    VerificationRecord,
+    VerificationResult,
     payload_hash,
 )
 from stag.techops.actions import (
@@ -59,9 +61,14 @@ def _trigger(event: StreamEvent, rule="pool_timeouts", confidence=0.9) -> Trigge
     )
 
 
+EVIDENCE = {"source": "probe:health", "window": "15m", "signals": ["error_rate", "p99"]}
+
+
 def _resolve(coord: IncidentCoordinator, incident_id: str) -> None:
-    for state in (IncidentState.TRIAGED, IncidentState.INVESTIGATING, IncidentState.VERIFYING, IncidentState.RESOLVED):
+    for state in (IncidentState.TRIAGED, IncidentState.INVESTIGATING, IncidentState.VERIFYING):
         coord.transition(incident_id, state, "op", "test path")
+    coord.record_verification(incident_id, VerificationResult(healthy=True, **EVIDENCE))
+    coord.transition(incident_id, IncidentState.RESOLVED, "op", "verified")
 
 
 # --------------------------------------------------------------------------- identity
@@ -102,13 +109,28 @@ class TestIncidentLifecycle:
             IncidentState.AUTHORIZED,
             IncidentState.EXECUTING,
             IncidentState.VERIFYING,
-            IncidentState.RESOLVED,
         ):
             inc.transition(state, actor="test", reason="step")
+        with pytest.raises(InvalidTransition):
+            inc.transition(IncidentState.RESOLVED, actor="test", reason="no verification yet")
+        inc.record_verification(VerificationRecord(healthy=True, at_version=inc.version, source="probe", window="15m", signals=["p99"]))
+        inc.transition(IncidentState.RESOLVED, actor="test", reason="verified")
         assert inc.state is IncidentState.RESOLVED
         assert not inc.is_open
         assert len(inc.history) == 7
         assert inc.version == 8  # 1 + 7 transitions
+
+    def test_stale_or_failed_verification_cannot_resolve(self):
+        inc = Incident(signal_key="k")
+        for state in (IncidentState.TRIAGED, IncidentState.INVESTIGATING, IncidentState.VERIFYING):
+            inc.transition(state, actor="t", reason="s")
+        inc.record_verification(VerificationRecord(healthy=False, at_version=inc.version, source="probe", window="15m", signals=["p99"]))
+        with pytest.raises(InvalidTransition):
+            inc.transition(IncidentState.RESOLVED, actor="t", reason="failed verdict")
+        inc.record_verification(VerificationRecord(healthy=True, at_version=inc.version, source="probe", window="15m", signals=["p99"]))
+        inc.attach_observation("obs-new")  # new evidence → verification is stale
+        with pytest.raises(InvalidTransition):
+            inc.transition(IncidentState.RESOLVED, actor="t", reason="stale verdict")
 
     def test_agent_cannot_jump_to_resolved(self):
         inc = Incident(signal_key="k")
@@ -247,15 +269,24 @@ class TestCoordinatorDedup:
         assert coord.get_incident(first.incident_id).late_evidence_count == 1
         assert coord.stats["total_incidents"] == 1
 
-    def test_replay_events_never_create_live_incidents(self):
+    def test_replay_tagged_events_are_rejected_in_live_mode(self):
         coord = IncidentCoordinator()
         ev = _event(metadata={"environment": "production", "service": "checkout-api", "replay": True})
         decision = coord.ingest(ev, _trigger(ev))
-        assert decision.accepted and decision.replay
-        assert decision.incident_id is None and decision.investigation_request is None
-        assert coord.stats["total_incidents"] == 0 and coord.stats["replay_observations"] == 1
-        # a redelivered replay is still a duplicate, not a second observation
+        assert not decision.accepted and decision.replay
+        assert coord.stats["total_incidents"] == 0 and coord.stats["replay_rejected"] == 1
+        # the live copy of the same identity is NOT suppressed by the rejected replay copy
+        live = ev.model_copy(update={"metadata": {"environment": "production", "service": "checkout-api"}})
+        assert coord.ingest(live, _trigger(live)).incident_id is not None
+
+    def test_replay_mode_isolates_replay_traffic(self):
+        coord = IncidentCoordinator(processing_mode="replay")
+        ev = _event(metadata={"environment": "production", "service": "checkout-api", "replay": True})
+        decision = coord.ingest(ev, _trigger(ev))
+        assert decision.accepted and decision.replay and decision.incident_id is None
         assert coord.ingest(ev, _trigger(ev)).duplicate
+        assert not coord.ingest(_event(), _trigger(_event())).accepted  # live traffic refused
+        assert coord.stats["total_incidents"] == 0
 
     def test_register_then_correlate_lets_callers_defer_stateful_work(self):
         coord = IncidentCoordinator()
@@ -454,7 +485,7 @@ class TestActionLedger:
         ledger.reconcile(rec.operation_id, target_state_observed=True)
         assert rec.state is ActionState.APPLIED  # applied is not verified
         assert rec.dispatch_attempts == 1  # the action was not repeated
-        ledger.verify(rec.operation_id, healthy=True, evidence={"error_rate": 0.001, "window_s": 600})
+        ledger.verify(rec.operation_id, healthy=True, evidence={**EVIDENCE, "details": {"error_rate": 0.001}})
         assert rec.state is ActionState.VERIFIED
 
     def test_reconcile_with_no_effect_retries_same_operation_id(self):
@@ -489,11 +520,11 @@ class TestActionLedger:
         rec = ledger.prepare("INC-1", "restart", "svc")
         ledger.authorize(rec.operation_id, "oncall", 1)
         ledger.dispatch(rec.operation_id)
-        ledger.verify(rec.operation_id, healthy=False, evidence={"healthy": True, "error_rate": 0.2})
+        ledger.verify(rec.operation_id, healthy=False, evidence={**EVIDENCE, "details": {"healthy": True, "error_rate": 0.2}})
         assert rec.state is ActionState.FAILED and rec.verification["healthy"] is False
         before = dict(rec.verification)
         with pytest.raises(InvalidActionTransition):
-            ledger.verify(rec.operation_id, healthy=True, evidence={"error_rate": 0.0})
+            ledger.verify(rec.operation_id, healthy=True, evidence=EVIDENCE)
         assert rec.verification == before  # rejected verification changed nothing
 
     def test_unknown_verdict_is_recorded_without_changing_state(self):
@@ -501,7 +532,7 @@ class TestActionLedger:
         rec = ledger.prepare("INC-1", "restart", "svc")
         ledger.authorize(rec.operation_id, "oncall", 1)
         ledger.dispatch(rec.operation_id)
-        ledger.verify(rec.operation_id, healthy=None, evidence={"reason": "collector silent"})
+        ledger.verify(rec.operation_id, healthy=None, evidence={**EVIDENCE, "details": {"reason": "collector silent"}})
         assert rec.state is ActionState.DISPATCHED
         assert len(rec.verification["unknown_verdicts"]) == 1
 
@@ -533,7 +564,7 @@ class TestActionLedger:
         ledger.authorize(rec.operation_id, actor="oncall@corp", incident_version=1)
         ledger.dispatch(rec.operation_id)
         assert rec.state is ActionState.DISPATCHED
-        ledger.verify(rec.operation_id, healthy=False, evidence={"error_rate": 0.12, "window_s": 300})
+        ledger.verify(rec.operation_id, healthy=False, evidence={**EVIDENCE, "details": {"error_rate": 0.12}})
         assert rec.state is ActionState.FAILED
 
 

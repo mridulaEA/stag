@@ -108,8 +108,16 @@ class InsightGenerator:
     ) -> GeneratedInsight:
         """Coerce arbitrary model output into a valid insight; malformed shapes degrade explicitly."""
         if not isinstance(data, dict):
-            data = {}
             mode, degraded_reason = "degraded", f"model returned {type(data).__name__}, expected object"
+            data = {}
+        else:
+            # Required response shape: summary and detail as text, severity valid. Anything else is
+            # not analysis and must not be labelled as such.
+            missing = [k for k in ("summary", "detail") if not isinstance(data.get(k), str) or not data.get(k).strip()]
+            if missing and mode == "llm":
+                mode, degraded_reason = "degraded", f"model response missing required fields: {', '.join(missing)}"
+            if mode == "llm" and self._parse_severity(data.get("severity")) is None:
+                mode, degraded_reason = "degraded", "model response has no valid severity"
 
         def text(key: str, default: str, limit: int) -> str:
             value = data.get(key)

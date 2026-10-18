@@ -107,9 +107,18 @@ def test_action_ledger_flow_over_api(client):
     assert client.post(f"/api/techops/actions/{op}/dispatch").status_code == 409  # no blind retry
     rec = client.post(f"/api/techops/actions/{op}/reconcile", params={"target_state_observed": True}).json()
     assert rec["state"] == "applied" and rec["dispatch_attempts"] == 1
-    ver = client.post(f"/api/techops/actions/{op}/verify",
-                      json={"healthy": True, "evidence": {"error_rate": 0.001, "window_s": 600}}).json()
+    # an unsubstantiated claim is rejected before anything is written
+    assert client.post(f"/api/techops/actions/{op}/verify", json={"healthy": True, "evidence": {}}).status_code == 422
+    assert client.post(f"/api/techops/actions/{op}/verify",
+                       json={"healthy": True, "evidence": {"source": "fixture", "window": "1m", "signals": ["x"], "simulated": True}}).status_code == 409
+    evidence = {"source": "probe:health", "window": "10m", "signals": ["error_rate"], "details": {"error_rate": 0.001}}
+    ver = client.post(f"/api/techops/actions/{op}/verify", json={"healthy": True, "evidence": evidence}).json()
     assert ver["state"] == "verified" and ver["verification"]["healthy"] is True
+    # resolution requires that current verification; a generic transition sequence cannot fake it
+    for to in ("investigating", "action_proposed", "authorized", "executing", "verifying"):
+        client.post(f"/api/techops/incidents/{inc['id']}/transition", json={"to": to, "actor": "op", "reason": "walk"})
+    blocked = client.post(f"/api/techops/incidents/{inc['id']}/transition", json={"to": "resolved", "actor": "op", "reason": "done"})
+    assert blocked.status_code == 409 and "stale" in blocked.json()["detail"]
 
     actions = client.get("/api/techops/actions").json()
     assert actions["stats"]["operations"] == 2

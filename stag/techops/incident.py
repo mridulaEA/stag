@@ -91,6 +91,20 @@ class InvalidTransition(Exception):
     """Raised when a lifecycle transition is not permitted."""
 
 
+class VerificationRecord(BaseModel):
+    """The verification result that may authorize RESOLVED. Bound to the evidence version it saw."""
+
+    healthy: bool
+    at_version: int
+    operation_id: str | None = None
+    source: str
+    window: str
+    signals: list[str]
+    simulated: bool = False
+    verified_by: str = "verifier"
+    at: datetime = Field(default_factory=_now)
+
+
 class Transition(BaseModel):
     from_state: IncidentState
     to_state: IncidentState
@@ -120,6 +134,7 @@ class Incident(BaseModel):
     external_refs: dict[str, str] = Field(default_factory=dict)
     last_investigation_version: int | None = None
     last_investigation_at: datetime | None = None
+    last_verification: VerificationRecord | None = None
     history: list[Transition] = Field(default_factory=list)
     attributes: dict[str, Any] = Field(default_factory=dict)
 
@@ -132,10 +147,38 @@ class Incident(BaseModel):
     def can_transition(self, to: IncidentState) -> bool:
         return to in TRANSITIONS[self.state]
 
+    @property
+    def resolution_blocker(self) -> str | None:
+        """Why RESOLVED is not permitted right now (None when a current, successful verification exists)."""
+        v = self.last_verification
+        if v is None:
+            return "no verification result recorded"
+        if not v.healthy:
+            return "last verification did not confirm recovery"
+        if v.at_version != self.version:
+            return f"verification is stale (seen v{v.at_version}, incident now v{self.version})"
+        return None
+
+    def record_verification(self, record: VerificationRecord) -> None:
+        """Attach an independent verification result bound to the current evidence version."""
+        if record.at_version != self.version:
+            raise InvalidTransition(
+                f"{self.id}: verification was taken at v{record.at_version} but the incident is at v{self.version}"
+            )
+        self.last_verification = record
+
     def transition(self, to: IncidentState, actor: str, reason: str) -> Transition:
-        """Apply a lifecycle transition. Raises InvalidTransition when the edge is not allowed."""
+        """Apply a lifecycle transition. Raises InvalidTransition when the edge is not allowed.
+
+        RESOLVED additionally requires a successful verification at the *current* evidence version;
+        a generic transition cannot manufacture that authority.
+        """
         if not self.can_transition(to):
             raise InvalidTransition(f"{self.id}: {self.state.value} → {to.value} is not permitted")
+        if to is IncidentState.RESOLVED:
+            blocker = self.resolution_blocker
+            if blocker:
+                raise InvalidTransition(f"{self.id}: cannot resolve — {blocker}")
         self.version += 1
         record = Transition(
             from_state=self.state, to_state=to, actor=actor, reason=reason, version=self.version

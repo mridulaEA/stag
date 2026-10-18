@@ -328,11 +328,13 @@ All configuration is via environment variables (or `.env` file):
 | `TECHOPS_INVESTIGATION_COOLDOWN_SECONDS` | `300` | Minimum gap between routine re-investigations (severity increase / new signature bypass it) |
 | `TECHOPS_RECURRENCE_WINDOW_SECONDS` | `3600` | Signal returning within this window after RESOLVED is flagged as recurrence |
 | `TECHOPS_DEDUP_RETENTION` | `50000` | Observation identities kept for duplicate detection (size to your replay horizon) |
+| `TECHOPS_PROCESSING_MODE` | `live` | `live` rejects replay-tagged events before any effect; `replay` isolates them and never opens incidents |
+| `INDEX_TIMEOUT_SECONDS` | `5.0` | Deadline for indexing one observation; detection is emitted before indexing regardless |
 | **Simulator** | | |
 | `SIMULATOR_INTERVAL` | `3.0` | Seconds between simulated events |
 | `SIMULATOR_SCENARIO` | `enterprise_ai` | Simulation scenario |
 | **Server** | | |
-| `HOST` | `0.0.0.0` | Server bind address |
+| `HOST` | `127.0.0.1` | Server bind address (no authentication: loopback by default; set `0.0.0.0` deliberately) |
 | `PORT` | `8000` | Server port |
 | `CORS_ORIGINS` | `["http://localhost:5173","http://localhost:3000"]` | Allowed CORS origins (JSON array) |
 
@@ -344,7 +346,8 @@ All configuration is via environment variables (or `.env` file):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/health` | Health with component readiness (`ok` / `degraded`) |
+| `GET` | `/api/health` | Liveness plus component status (`ok` / `degraded`, `ready` flag) |
+| `GET` | `/api/ready` | Readiness probe: 503 unless the stream processing task is alive |
 | `GET` | `/api/stats` | Pipeline statistics |
 | `GET` | `/api/events?limit=50` | Recent stream events |
 | `POST` | `/api/events` | Inject an event |

@@ -59,8 +59,10 @@ class StreamEvent(BaseModel):
 
     @property
     def doc_key(self) -> str:
-        """Source-scoped key for knowledge stores: the same id from two sources never collides."""
-        return f"{self.source}::{self.id}"
+        """Canonical source-scoped key for knowledge stores (JSON array, collision-free)."""
+        import json
+
+        return json.dumps([self.source, self.id], separators=(",", ":"), ensure_ascii=False)
 
     @property
     def is_replay(self) -> bool:

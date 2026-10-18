@@ -7,15 +7,15 @@ does today so demo counters are not mistaken for measured results or tested prod
 |---|---|---|---|
 | Deterministic detection | Rule engine; `trigger` events emitted before enrichment; failures in indexing/retrieval/generation do not suppress detection | — | Independent paging destination; bounded work queues; detection-only degraded startup |
 | Identity & dedup | Canonical observation keys; envelope hash; register-before-index; source-scoped store keys | — | Transactional store with unique constraints across workers |
-| Incident lifecycle | Versioned state machine; RESOLVED only via VERIFYING; recorded transitions with actor/reason | — | Durable persistence; multi-process consistency |
+| Incident lifecycle | Versioned state machine; RESOLVED requires a current successful verification record (generic transitions cannot resolve); recorded transitions with actor/reason | — | Durable persistence; multi-process consistency |
 | Material-change investigation | Requests only on new episode / severity increase / new signature / recurrence / cooldown | — | Queued/running/succeeded/failed work lifecycle; stale-result handling |
 | Bounded investigation | Assignment snapshot; capability catalog; scope checks on parameters; limits | Template findings from `DeterministicExecutor` | Trusted tool/model gateway with credentials unavailable to executors |
-| Remediation ledger | Terms-bound operation id; APPLIED vs VERIFIED; no dispatch from uncertain states; retry budget; server-derived freshness in the API | Dispatch changes a record only | Destination adapters; live preconditions; conflict locks; approval expiry |
-| Recovery verification | Typed verdicts; unknown never resolves; evidence validation before write | Fixture verdicts in scenarios (`simulated: true`) | Independent fresh probes over observation windows |
+| Remediation ledger | Terms-bound operation id with integrity digest checked on every command; APPLIED vs VERIFIED; no dispatch from uncertain states; cumulative retry ceiling with audited extension; server-derived freshness in the API | Dispatch changes a record only | Destination adapters; live preconditions; conflict locks; approval expiry |
+| Recovery verification | `VerificationResult` (source, window, signals) required; real-bool verdicts only; unknown never resolves; result bound to the incident's evidence version | Fixture verdicts in scenarios (`simulated: true`), accepted only by a simulation-mode coordinator | Independent fresh probes over observation windows |
 | Budgets | Finite non-negative arithmetic; reserve/settle; settled refs immutable | One unit per recorded model call in crews | Real token/cost accounting; atomic enforcement across workers |
 | Crews | Schema-enforced gates (human approver, policy ≤ medium, no automated mutation); end-to-end runs with and without approval; CLI exit codes | Every run (`mode: simulation`) | Durable, resumable live workflow with authenticated approvals |
-| Replay / late events | Replay observations isolated from live incidents; late evidence corrects the timeline; event-time recurrence | — | Watermarks, clock-skew policy, isolated replay outputs per adapter |
-| API | Bounded query params; readiness in `/api/health`; 422 on invalid scenario input | — | **Authentication and authorization (none today)**; rate limits; job admission |
+| Replay / late events | Runtime `TECHOPS_PROCESSING_MODE`: live rejects replay-tagged events before any effect; replay mode isolates them; late evidence corrects the timeline; event-time recurrence | — | Watermarks, clock-skew policy, isolated replay outputs per adapter |
+| API | Bounded query params; `/api/health` readiness from the live task; `/api/ready` 503 when the stream task is dead; 422 on invalid scenario or empty verification evidence; loopback bind by default | — | **Authentication and authorization (none today)**; rate limits; job admission |
 | Knowledge stores | In-memory NumPy cosine + BM25 + NetworkX with file persistence | — | Consistent atomic snapshots; retention; retrieval evaluation |
 | Generation | Output validated at one boundary; `generation_mode` llm / fallback / degraded | Template fallback without an API key | Claim-level grounding; model-route governance |
 | Packaging | Wheel bundles skills/crews/agents; validators fail on empty catalogs; CI installed-package check | — | Container smoke test in CI |
@@ -29,8 +29,13 @@ does today so demo counters are not mistaken for measured results or tested prod
 
 ## Migration notes
 
-- Knowledge-store document keys changed from `<event id>` to `<source>::<event id>`. Delete
-  `data/` (or rebuild the index) when upgrading from 0.2.x.
+- Knowledge-store document keys changed to a canonical JSON pair `["<source>","<event id>"]`
+  (0.3.0 briefly used `source::id`). Delete `data/` (or rebuild the index) when upgrading.
+- `Incident.signal_key` is now a canonical JSON key; the readable form is
+  `attributes["signal_display"]`, which is what scenario verification hints match.
+- `ActionLedger.verify` takes a `VerificationResult` (or a dict with `source`, `window`, `signals`).
+- `IncidentCoordinator(processing_mode=...)`: replay-tagged events are rejected in live mode.
+- Default `HOST` is now `127.0.0.1`; set `HOST=0.0.0.0` explicitly (the Dockerfile does).
 - `ActionLedger.reconcile(True)` now yields `APPLIED`; callers must `verify` to reach `VERIFIED`.
 - `reconcile(False)` yields `RETRY_READY`; the retry is an explicit `dispatch`.
 - Operation ids now include `policy_version` and `preconditions`.

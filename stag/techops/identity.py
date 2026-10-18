@@ -50,8 +50,8 @@ def canonical_key(*parts: str) -> str:
 
 
 def display_key(*parts: str) -> str:
-    """Human-readable composite key with ``|`` escaped inside components."""
-    return "|".join(quote(str(p), safe="").replace("%7C", "%7C") if "|" in str(p) else str(p) for p in parts)
+    """Human-readable composite key. For display only: never use it for correlation or storage."""
+    return "|".join(quote(str(p), safe="") if "|" in str(p) or "%" in str(p) else str(p) for p in parts)
 
 
 def payload_hash(payload: dict[str, Any]) -> str:
@@ -103,6 +103,14 @@ class SignalKey(BaseModel):
 
     @property
     def key(self) -> str:
+        """Canonical machine key (JSON): collision-free, extras kept as a mapping."""
+        body = [self.tenant, self.environment, self.service, self.failure_domain, self.symptom_class]
+        if self.extra:
+            body.append({str(k): str(v) for k, v in self.extra.items()})
+        return _canonical(body)
+
+    @property
+    def display(self) -> str:
         parts = [self.tenant, self.environment, self.service, self.failure_domain, self.symptom_class]
         if self.extra:
             parts.append(",".join(f"{k}={self.extra[k]}" for k in sorted(self.extra)))

@@ -177,13 +177,21 @@ def _dest_root(target: str, scope: str, project_dir: Path, home: Path) -> Path:
 
 
 def _is_source(src: Path, dest: Path) -> bool:
-    """True when ``dest`` *is* the canonical source (directly or through a symlinked parent)."""
+    """True when the directory *entry* ``dest`` lives inside the canonical source tree.
+
+    Distinguishes two cases that resolve to the same path:
+    * ``dest`` is a leaf symlink (``~/.agents/skills/x -> /repo/skills/x``): the entry itself is
+      outside the source tree, so unlinking it only removes the link → not the source.
+    * ``dest``'s *parent* is a symlink into the source tree (``repo/.agents/skills -> ../skills``):
+      the entry is the canonical directory → protected.
+    """
     try:
-        resolved_dest = dest.resolve()
+        parent = dest.parent.resolve()
     except OSError:
         return False
-    resolved_src = src.resolve()
-    return resolved_dest == resolved_src or resolved_src in resolved_dest.parents or resolved_dest in resolved_src.parents
+    entry = parent / dest.name
+    source = src.resolve()
+    return entry == source or source in entry.parents or entry in source.parents
 
 
 def _link_or_copy(src: Path, dest: Path, mode: str, force: bool) -> str:

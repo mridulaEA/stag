@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     generation_max_tokens: int = 1024
     generation_temperature: float = 0.3
 
-    # Server
-    host: str = "0.0.0.0"
+    # Server (local demo: no authentication → loopback by default; set HOST=0.0.0.0 deliberately)
+    host: str = "127.0.0.1"
     port: int = 8000
     cors_origins: str = '["http://localhost:5173","http://localhost:3000"]'
 
@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     techops_investigation_cooldown_seconds: int = 300
     techops_recurrence_window_seconds: int = 3600
     techops_dedup_retention: int = 50000
+    techops_processing_mode: Literal["live", "replay"] = "live"
+    index_timeout_seconds: float = 5.0
 
     # Simulator
     simulator_interval: float = 3.0

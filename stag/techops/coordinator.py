@@ -28,8 +28,17 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from stag.models.schemas import Severity, StreamEvent, TriggerResult
+from stag.techops.actions import VerificationResult
 from stag.techops.identity import ObservationIdentity, SignalKey, envelope_hash
-from stag.techops.incident import Incident, IncidentState, MaterialChange
+from stag.techops.incident import (
+    Incident,
+    IncidentState,
+    InvalidTransition,
+    MaterialChange,
+    VerificationRecord,
+)
+
+PROCESSING_MODES = ("live", "replay", "simulation")
 
 SEVERITY_ORDER = {Severity.LOW: 0, Severity.MEDIUM: 1, Severity.HIGH: 2, Severity.CRITICAL: 3}
 
@@ -112,6 +121,10 @@ class IncidentCoordinator:
         redelivery / replay horizon.
     signal_key_fn: Derive a SignalKey from (event, trigger). Default: metadata.service / environment,
         event_type as failure domain, rule name as symptom class.
+    processing_mode: ``live`` (default) rejects replay-tagged events before any effect; ``replay``
+        accepts only replay-tagged events into an isolated namespace and never opens incidents;
+        ``simulation`` is live behaviour that additionally accepts simulated verification evidence.
+        The mode is runtime configuration, never chosen by event metadata.
     """
 
     def __init__(
@@ -121,9 +134,13 @@ class IncidentCoordinator:
         recurrence_window_seconds: int = 3600,
         dedup_retention: int = 50_000,
         signal_key_fn: Callable[[StreamEvent, TriggerResult], SignalKey] | None = None,
+        processing_mode: str = "live",
     ) -> None:
         if investigation_cooldown_seconds < 0 or recurrence_window_seconds < 0 or dedup_retention < 1:
             raise ValueError("cooldown and recurrence window must be >= 0 and dedup_retention >= 1")
+        if processing_mode not in PROCESSING_MODES:
+            raise ValueError(f"processing_mode must be one of {PROCESSING_MODES}")
+        self.processing_mode = processing_mode
         self.tenant = tenant
         self.cooldown = timedelta(seconds=investigation_cooldown_seconds)
         self.recurrence_window = timedelta(seconds=recurrence_window_seconds)
@@ -136,11 +153,14 @@ class IncidentCoordinator:
         self._open_by_signal: dict[str, str] = {}
         self._last_resolved: dict[str, tuple[str, datetime]] = {}
         self._requests: dict[str, InvestigationRequest] = {}
+        self._seen_replay: OrderedDict[str, Observation] = OrderedDict()
         self._stats = {
             "observations_accepted": 0,
             "duplicate_deliveries": 0,
             "conflicting_deliveries": 0,
             "replay_observations": 0,
+            "replay_rejected": 0,
+            "verifications_recorded": 0,
             "late_evidence": 0,
             "incidents_created": 0,
             "investigations_requested": 0,
@@ -185,8 +205,31 @@ class IncidentCoordinator:
     # ------------------------------------------------------------------ phase 1: register
 
     def register(self, event: StreamEvent) -> RegistrationResult:
-        """Identity check. Call this before indexing or evaluating stateful trigger rules."""
+        """Identity check. Call this before indexing or evaluating stateful trigger rules.
+
+        Replay-tagged events are rejected in live/simulation mode and isolated in replay mode, so
+        historical traffic can never touch live dedup state, frequency counts, indexes or incidents.
+        """
         identity = ObservationIdentity(tenant=self.tenant, source=event.source, event_id=event.id)
+        if self.processing_mode == "replay":
+            if not event.is_replay:
+                return RegistrationResult(accepted=False, observation_key=identity.key,
+                                          reason="live event rejected: coordinator is in replay mode")
+            if identity.key in self._seen_replay:
+                self._stats["duplicate_deliveries"] += 1
+                return RegistrationResult(accepted=False, duplicate=True, replay=True, observation_key=identity.key,
+                                          reason="duplicate replay delivery")
+            self._seen_replay[identity.key] = Observation(identity=identity, payload_hash=self._hash(event),
+                                                          event_time=event.event_time, replay=True)
+            while len(self._seen_replay) > self.dedup_retention:
+                self._seen_replay.popitem(last=False)
+            self._stats["replay_observations"] += 1
+            return RegistrationResult(accepted=True, replay=True, observation_key=identity.key,
+                                      reason="replay observation recorded in the isolated replay namespace")
+        if event.is_replay:
+            self._stats["replay_rejected"] += 1
+            return RegistrationResult(accepted=False, replay=True, observation_key=identity.key,
+                                      reason="replay-tagged event rejected in live mode; use a replay-mode coordinator")
         digest = self._hash(event)
         prior = self._seen.get(identity.key)
         if prior is not None:
@@ -209,17 +252,10 @@ class IncidentCoordinator:
                 prior_incident_id=prior.incident_id,
                 reason="same observation identity with a different envelope; quarantined",
             )
-        observation = Observation(
-            identity=identity, payload_hash=digest, event_time=event.event_time, replay=event.is_replay
-        )
+        observation = Observation(identity=identity, payload_hash=digest, event_time=event.event_time)
         self._remember(observation)
         self._stats["observations_accepted"] += 1
-        if event.is_replay:
-            self._stats["replay_observations"] += 1
-        return RegistrationResult(
-            accepted=True, replay=event.is_replay, observation_key=identity.key,
-            reason="replay observation recorded; isolated from live incidents" if event.is_replay else "observation accepted",
-        )
+        return RegistrationResult(accepted=True, observation_key=identity.key, reason="observation accepted")
 
     # ------------------------------------------------------------------ phase 2: correlate
 
@@ -228,15 +264,14 @@ class IncidentCoordinator:
         identity_key = registration.observation_key if registration else ObservationIdentity(
             tenant=self.tenant, source=event.source, event_id=event.id
         ).key
+        if self.processing_mode == "replay" or event.is_replay:
+            return CoordinatorDecision(
+                accepted=True, replay=True,
+                reason="replay: observation recorded in the replay namespace; no incident, paging or investigation",
+            )
         observation = self._seen.get(identity_key)
         if observation is None:
             raise ValueError("correlate() requires a registered observation; call register() first")
-
-        if event.is_replay:
-            return CoordinatorDecision(
-                accepted=True, replay=True,
-                reason="replay mode: observation recorded, no live incident, paging or investigation",
-            )
         if trigger is None or not trigger.fired:
             return CoordinatorDecision(accepted=True, reason="observation recorded; no trigger fired")
 
@@ -307,6 +342,7 @@ class IncidentCoordinator:
                 "environment": signal.environment,
                 "failure_domain": signal.failure_domain,
                 "symptom_class": signal.symptom_class,
+                "signal_display": signal.display,
             }
         )
         if related:
@@ -396,6 +432,33 @@ class IncidentCoordinator:
             self._open_by_signal.pop(incident.signal_key, None)
             if to is IncidentState.RESOLVED:
                 self._last_resolved[incident.signal_key] = (incident.id, _now())
+        return incident
+
+    def record_verification(
+        self,
+        incident_id: str,
+        result: VerificationResult,
+        operation_id: str | None = None,
+        verified_by: str = "verifier",
+    ) -> Incident:
+        """Attach an independent verification result to an incident at its current version.
+
+        Simulated evidence is accepted only by a coordinator in ``simulation`` mode; a live
+        coordinator refuses it so a fixture can never authorize a live RESOLVED.
+        """
+        incident = self.get_incident(incident_id)
+        if result.simulated and self.processing_mode != "simulation":
+            raise InvalidTransition(f"{incident_id}: simulated verification evidence is not accepted in {self.processing_mode} mode")
+        if result.healthy is None:
+            return incident  # unknown: recorded nowhere as success
+        incident.record_verification(
+            VerificationRecord(
+                healthy=result.healthy, at_version=incident.version, operation_id=operation_id,
+                source=result.source, window=result.window, signals=list(result.signals),
+                simulated=result.simulated, verified_by=verified_by,
+            )
+        )
+        self._stats["verifications_recorded"] += 1
         return incident
 
     def link_external(self, incident_id: str, system: str, external_id: str) -> None:

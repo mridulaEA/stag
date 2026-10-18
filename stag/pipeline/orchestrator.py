@@ -56,6 +56,8 @@ class PipelineOrchestrator:
         self._running = False
         self._task: asyncio.Task | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self.last_error: str | None = None
+        self.index_timeout_seconds = getattr(settings, "index_timeout_seconds", 5.0)
         self._callbacks: list = []
         self._recent_events: deque[StreamEvent] = deque(maxlen=100)
         self._recent_outputs: deque[PipelineOutput] = deque(maxlen=50)
@@ -83,9 +85,37 @@ class PipelineOrchestrator:
             if self._running and self._task is not None and not self._task.done():
                 return
             self._running = True
+            self.last_error = None
             await self.stream.start()
             self._task = asyncio.create_task(self._process_loop(), name="stag-pipeline")
+            self._task.add_done_callback(self._on_task_done)
             logger.info("pipeline.started", stream=type(self.stream).__name__)
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Supervise the processing task: an unexpected end clears readiness and records why."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.error("pipeline.task_failed", error=self.last_error)
+        elif self._running:
+            self.last_error = "stream ended unexpectedly"
+            logger.error("pipeline.stream_ended")
+        self._running = False
+
+    @property
+    def healthy(self) -> bool:
+        """Readiness: the processing task is alive, not merely requested."""
+        return self._running and self._task is not None and not self._task.done()
+
+    @property
+    def status(self) -> str:
+        if self.healthy:
+            return "ready"
+        if self.last_error:
+            return "failed"
+        return "stopped"
 
     async def stop(self) -> None:
         """Stop the pipeline (idempotent): cancel and await the processing task, then persist."""
@@ -117,6 +147,15 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.error("pipeline.event_error", event_id=event.id, error=str(e))
 
+    async def _index(self, event: StreamEvent) -> None:
+        """Index an accepted observation with a deadline; a stalled store cannot hold the loop."""
+        try:
+            await asyncio.wait_for(self.retriever.add_event(event), timeout=self.index_timeout_seconds)
+        except TimeoutError:
+            logger.error("pipeline.index_timeout", event_id=event.id, timeout=self.index_timeout_seconds)
+        except Exception as e:
+            logger.error("pipeline.index_error", event_id=event.id, error=str(e))
+
     async def _emit(self, message: dict) -> None:
         for cb in self._callbacks:
             try:
@@ -137,8 +176,8 @@ class PipelineOrchestrator:
         self._event_count += 1
         self._recent_events.append(event)
 
-        # Step 0 (TechOps): register identity first. Duplicates and conflicts are never indexed and
-        # never reach stateful trigger rules, so they cannot inflate frequency counts or graph weights.
+        # Step 0 (TechOps): register identity first. Duplicates, conflicts and replay-tagged events in
+        # live mode are never indexed and never reach stateful trigger rules.
         registration = None
         if self.coordinator is not None:
             registration = self.coordinator.register(event)
@@ -153,20 +192,20 @@ class PipelineOrchestrator:
                             "accepted": False,
                             "duplicate": registration.duplicate,
                             "conflicting": registration.conflicting,
+                            "replay": registration.replay,
                             "incident_id": registration.prior_incident_id,
                             "reason": registration.reason,
                         },
                     }
                 )
                 return
+        elif event.is_replay:
+            # No coordinator: still never let replay-tagged traffic act as live detection.
+            await self._emit({"type": "incident_update", "event": event.model_dump(mode="json"), "trigger": None,
+                              "decision": {"accepted": False, "replay": True, "reason": "replay-tagged event ignored in live mode"}})
+            return
 
-        # Step 1: Index event into knowledge stores (accepted observations only)
-        try:
-            await self.retriever.add_event(event)
-        except Exception as e:  # indexing is enrichment; it must not block detection
-            logger.error("pipeline.index_error", event_id=event.id, error=str(e))
-
-        # Step 2: Evaluate deterministic triggers
+        # Step 1: Evaluate deterministic triggers *before* any optional enrichment
         trigger = self.triggers.evaluate(event)
 
         if trigger is None:
@@ -174,17 +213,18 @@ class PipelineOrchestrator:
             if self.coordinator is not None:
                 self.coordinator.correlate(event, None, registration)
             await self._emit({"type": "event", "event": event.model_dump(mode="json")})
+            await self._index(event)
             return
 
         self._trigger_count += 1
 
-        # Step 2b (TechOps): correlate before investigating. Repeated symptoms update incident
-        # evidence; replay events and non-material changes never reach the LLM path.
+        # Step 2 (TechOps): correlate before investigating. Repeated symptoms update incident
+        # evidence; non-material changes never reach the LLM path.
         decision = None
         if self.coordinator is not None:
             decision = self.coordinator.correlate(event, trigger, registration)
 
-        # Step 3: emit the deterministic detection *now*, independent of retrieval/generation.
+        # Step 3: emit the deterministic detection *now*, before indexing, retrieval or generation.
         await self._emit(
             {
                 "type": "trigger",
@@ -193,6 +233,9 @@ class PipelineOrchestrator:
                 "decision": decision.model_dump(mode="json") if decision else None,
             }
         )
+
+        # Step 3b: index the accepted observation (enrichment, bounded by a deadline)
+        await self._index(event)
 
         if decision is not None and decision.investigation_request is None:
             self._suppressed_count += 1
@@ -322,6 +365,8 @@ class PipelineOrchestrator:
             "investigations_suppressed": self._suppressed_count,
             "trigger_rate": self._trigger_count / max(1, self._event_count),
             "techops": self.coordinator.stats if self.coordinator else None,
+            "status": self.status,
+            "last_error": self.last_error,
             "trigger_engine": self.triggers.stats,
             "retriever": self.retriever.stats,
             "generator": self.generator.stats,

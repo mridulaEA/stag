@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from stag.crews import CREWS_DIR, Scenario, discover_crews, load_crew, load_scenario, run_crew
 from stag.models import StreamEvent
-from stag.techops import ActionLedger, IncidentState
+from stag.techops import ActionLedger, IncidentState, VerificationResult
 
 router = APIRouter()
 
@@ -32,7 +32,8 @@ def set_dependencies(pipeline, ws_manager, action_ledger: ActionLedger | None = 
 async def health():
     """Liveness plus component readiness. ``status`` is ``degraded`` when a required part is down."""
     components = {
-        "pipeline": "ready" if _pipeline is not None and getattr(_pipeline, "_running", False) else "not_running",
+        "pipeline": getattr(_pipeline, "status", "not_initialized") if _pipeline is not None else "not_initialized",
+        "pipeline_error": getattr(_pipeline, "last_error", None) if _pipeline is not None else None,
         "generator": (
             "llm" if _pipeline is not None and getattr(getattr(_pipeline, "generator", None), "stats", {}).get("has_client")
             else "fallback"
@@ -40,8 +41,16 @@ async def health():
         "techops_coordinator": "enabled" if _pipeline is not None and getattr(_pipeline, "coordinator", None) else "disabled",
         "websocket_clients": _ws_manager.connection_count if _ws_manager is not None else 0,
     }
-    status = "ok" if components["pipeline"] == "ready" else "degraded"
-    return {"status": status, "version": "0.3.0", "mode": "local-demo", "components": components}
+    ready = components["pipeline"] == "ready"
+    return {"status": "ok" if ready else "degraded", "ready": ready, "version": "0.3.0", "mode": "local-demo", "components": components}
+
+
+@router.get("/ready")
+async def ready():
+    """Readiness probe: 503 unless the stream processing task is alive."""
+    if _pipeline is None or not getattr(_pipeline, "healthy", False):
+        raise HTTPException(503, f"pipeline not ready: {getattr(_pipeline, 'last_error', None) or getattr(_pipeline, 'status', 'not_initialized')}")
+    return {"ready": True}
 
 
 @router.get("/stats")
@@ -158,9 +167,22 @@ class AuthorizeActionRequest(BaseModel):
     expected_incident_version: int | None = Field(default=None, ge=1)
 
 
+class VerificationEvidence(BaseModel):
+    """Evidence for a verification claim: where it came from, over what window, which signals."""
+
+    source: str = Field(min_length=1, max_length=200)
+    window: str = Field(min_length=1, max_length=200)
+    signals: list[str] = Field(min_length=1, max_length=64)
+    target: str | None = Field(default=None, max_length=200)
+    simulated: bool = False
+    details: dict = Field(default_factory=dict)
+
+
 class VerifyActionRequest(BaseModel):
+    """A verification claim. Empty evidence does not validate (422)."""
+
     healthy: bool | None
-    evidence: dict = Field(default_factory=dict)
+    evidence: VerificationEvidence
     actor: str = Field(default="verifier", min_length=1, max_length=200)
 
 
@@ -246,7 +268,7 @@ async def prepare_action(body: PrepareActionRequest):
     if not incident.is_open:
         raise HTTPException(409, f"incident {body.incident_id} is {incident.state.value}; no new actions")
     record = _action_ledger.prepare(**body.model_dump())
-    return record.model_dump(mode="json")
+    return _action_ledger.view(record.operation_id).model_dump(mode="json")
 
 
 @router.post("/techops/actions/{operation_id}/authorize")
@@ -318,12 +340,22 @@ async def action_applied(operation_id: str):
 
 @router.post("/techops/actions/{operation_id}/verify")
 async def verify_action(operation_id: str, body: VerifyActionRequest):
-    _operation_or_404(operation_id)
+    """Record independent verification on the operation *and* bind it to the incident.
+
+    Simulated evidence is refused by the live coordinator; a healthy verdict is required (and
+    must be current) before the incident can be transitioned to RESOLVED.
+    """
+    record = _operation_or_404(operation_id)
+    incident = _incident_for_operation(record)
+    if body.evidence.simulated:
+        raise HTTPException(409, "simulated verification evidence is not accepted by the live coordinator")
     try:
-        record = _action_ledger.verify(operation_id, body.healthy, body.evidence, body.actor)
-    except Exception as e:
+        result = VerificationResult(healthy=body.healthy, **body.evidence.model_dump())
+        _action_ledger.verify(operation_id, body.healthy, result, body.actor)
+        _coordinator().record_verification(incident.id, result, operation_id=operation_id, verified_by=body.actor)
+    except (ValueError, Exception) as e:
         raise HTTPException(409, str(e)) from e
-    return record.model_dump(mode="json")
+    return _action_ledger.view(operation_id).model_dump(mode="json")
 
 
 # --- Crews ---
