@@ -51,8 +51,13 @@ cd frontend && npm install && npm run dev  # dashboard at :5173
 
 - `stag/techops/` is the deterministic backbone: `identity` → `incident` (state machine) →
   `coordinator` (dedup, correlation, material change) → `assignment` (bounded agent contract) →
-  `actions` (retry-safe ledger) → `budget` (admission control). Keep it pure Python + pydantic,
-  no I/O, fully unit-tested.
+  `actions` (retry-safe ledger) → `budget` (admission control). The *logic* stays pure Python +
+  pydantic and fully unit-tested; the *state* lives behind `store.ControlStore` (in-memory, SQLite,
+  PostgreSQL via `CONTROL_STORE_URL`). Every mutation is load → mutate → compare-and-swap inside
+  `store.transaction()`; races are settled by `insert_unique`, never by checking then writing.
+- Investigation requests are work items: queued → running (leased to one worker id) → succeeded |
+  failed. Claim before model work, complete with the outcome; never generate for a request you do
+  not hold.
 - The orchestrator (`stag/pipeline/orchestrator.py`) calls the coordinator *before* retrieval and
   generation when `TECHOPS_COORDINATOR_ENABLED=true`. Duplicate deliveries and evidence-only
   updates must never reach the LLM.

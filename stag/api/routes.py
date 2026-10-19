@@ -246,9 +246,24 @@ async def link_external(incident_id: str, body: ExternalLinkRequest):
 
 
 @router.get("/techops/investigations")
-async def list_investigations():
+async def list_investigations(pending: bool = False):
+    """Investigation requests with their work lifecycle (queued → running → succeeded | failed).
+
+    ``pending=true`` lists only the work still claimable by a worker (queued, or failed and retryable).
+    """
     coord = _coordinator()
-    return {"investigations": [r.model_dump(mode="json") for r in coord.investigation_requests]}
+    requests = coord.pending_investigations() if pending else coord.investigation_requests
+    return {"investigations": [r.model_dump(mode="json") for r in requests]}
+
+
+@router.get("/techops/investigations/{request_id}")
+async def get_investigation(request_id: str):
+    coord = _coordinator()
+    try:
+        request = coord.get_request(request_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown investigation request {request_id}") from None
+    return {"investigation": request.model_dump(mode="json"), "stale": coord.is_request_stale(request_id)}
 
 
 @router.get("/techops/actions")

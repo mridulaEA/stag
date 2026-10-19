@@ -176,3 +176,96 @@ async def test_start_stop_are_idempotent_and_own_the_task():
     await orch.stop()
     assert orch._task is None and not orch._running
     await orch.stop()  # no error on repeated stop
+
+
+async def test_investigation_request_is_leased_and_completed_by_the_generating_worker():
+    coord = IncidentCoordinator(investigation_cooldown_seconds=3600)
+    orch, generator, messages = _orchestrator(coord)
+    orch.worker_id = "worker-a"
+    await orch.inject_event(_event())
+    assert generator.calls == 1
+    request = coord.investigation_requests[0]
+    assert request.status == "succeeded"
+    assert request.attempts == 1
+    assert request.lease_owner is None
+    assert request.result_summary == "t"
+    assert coord.pending_investigations() == []
+
+
+async def test_second_worker_on_the_same_request_does_not_generate():
+    """Two orchestrators share one control store (multi-worker). Both see the same material change
+    for the same event; only the lease holder calls the model."""
+    from stag.techops.store import InMemoryControlStore
+
+    store = InMemoryControlStore()
+    coord_a = IncidentCoordinator(investigation_cooldown_seconds=3600, store=store)
+    coord_b = IncidentCoordinator(investigation_cooldown_seconds=3600, store=store)
+    orch_a, gen_a, _ = _orchestrator(coord_a)
+    orch_b, gen_b, messages_b = _orchestrator(coord_b)
+    orch_a.worker_id, orch_b.worker_id = "worker-a", "worker-b"
+
+    event = _event()
+    # Pre-lease the request the way worker A would right after correlating, then let B process.
+    reg = coord_a.register(event)
+    decision = coord_a.correlate(event, orch_a.triggers.evaluate(event), reg)
+    assert coord_a.claim_investigation(decision.investigation_request.id, "worker-a", 300) is not None
+
+    # B receives the same event (second delivery → duplicate, no generation) and a fresh observation
+    # of the same symptom (non-material → no generation): in neither case does B touch the lease.
+    await orch_b.inject_event(event)
+    await orch_b.inject_event(_event())
+    assert gen_b.calls == 0
+    assert gen_a.calls == 0
+    request = coord_b.get_request(decision.investigation_request.id)
+    assert request.status == "running" and request.lease_owner == "worker-a"
+    # B refuses to complete work it does not hold.
+    import pytest
+
+    from stag.techops.store import ConflictError
+
+    with pytest.raises(ConflictError):
+        coord_b.complete_investigation(request.id, "worker-b", succeeded=True)
+
+
+async def test_degraded_generation_leaves_the_request_retryable():
+    class FailingGenerator(StubGenerator):
+        async def generate(self, event, trigger, retrieval):
+            self.calls += 1
+            raise RuntimeError("provider down")
+
+    coord = IncidentCoordinator(investigation_cooldown_seconds=3600)
+    orch, _, messages = _orchestrator(coord)
+    orch.generator = FailingGenerator()
+    await orch.inject_event(_event())
+    insight = next(m for m in messages if m["type"] == "insight")
+    assert insight["output"]["insight"]["generation_mode"] == "degraded"
+    request = coord.investigation_requests[0]
+    assert request.status == "failed"
+    assert [r.id for r in coord.pending_investigations()] == [request.id]
+    # another worker can pick the failed work up
+    assert coord.claim_investigation(request.id, "worker-b", 300).attempts == 2
+
+
+async def test_request_leased_elsewhere_suppresses_generation_on_this_worker():
+    """Direct race: the decision this worker computed carries a request another worker already leased."""
+    from stag.techops.store import InMemoryControlStore
+
+    store = InMemoryControlStore()
+    coord = IncidentCoordinator(investigation_cooldown_seconds=3600, store=store)
+    orch, generator, messages = _orchestrator(coord)
+    orch.worker_id = "worker-a"
+    event = _event()
+    original_correlate = coord.correlate
+
+    def correlate_then_lose_race(ev, trigger, registration):
+        decision = original_correlate(ev, trigger, registration)
+        if decision.investigation_request is not None:
+            store.claim(coord.REQUESTS, decision.investigation_request.id, "worker-b", 300, from_statuses=("queued",))
+        return decision
+
+    coord.correlate = correlate_then_lose_race
+    await orch.inject_event(event)
+    assert generator.calls == 0
+    assert messages[-1]["type"] == "incident_update"
+    assert "another worker" in messages[-1]["decision"]["reason"]
+    assert orch.stats["investigations_suppressed"] == 1

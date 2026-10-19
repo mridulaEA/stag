@@ -330,6 +330,9 @@ All configuration is via environment variables (or `.env` file):
 | `TECHOPS_DEDUP_RETENTION` | `50000` | Observation identities kept for duplicate detection (size to your replay horizon) |
 | `TECHOPS_PROCESSING_MODE` | `live` | `live` rejects replay-tagged events before any effect; `replay` isolates them and never opens incidents |
 | `INDEX_TIMEOUT_SECONDS` | `5.0` | Deadline for indexing one observation; detection is emitted before indexing regardless |
+| `CONTROL_STORE_URL` | *(empty)* | Durable control state for observations, incidents, investigation requests and the action ledger. Empty or `memory://` is process-local; `sqlite:///./data/control.sqlite` survives restarts on one host; `postgresql://…` serves several workers (install `stag[postgres]`) |
+| `TECHOPS_WORKER_ID` | `<hostname>:<pid>` | Identity used when leasing investigation requests to this worker |
+| `TECHOPS_INVESTIGATION_LEASE_SECONDS` | `300` | Lease length for one investigation; an expired lease (crashed worker) becomes claimable again |
 | **Simulator** | | |
 | `SIMULATOR_INTERVAL` | `3.0` | Seconds between simulated events |
 | `SIMULATOR_SCENARIO` | `enterprise_ai` | Simulation scenario |

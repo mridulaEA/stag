@@ -37,6 +37,7 @@ from stag.techops.incident import (
     MaterialChange,
     VerificationRecord,
 )
+from stag.techops.store import ConflictError, ControlStore, InMemoryControlStore
 
 PROCESSING_MODES = ("live", "replay", "simulation")
 
@@ -81,11 +82,27 @@ class InvestigationRequest(BaseModel):
     reason: MaterialChange
     created_at: datetime = Field(default_factory=_now)
     context: dict[str, Any] = Field(default_factory=dict)
+    # work lifecycle (R16): queued → running (leased) → succeeded | failed; failed is re-claimable
+    status: str = "queued"
+    attempts: int = 0
+    lease_owner: str | None = None
+    lease_until: datetime | None = None
+    result_summary: str | None = None
+    completed_at: datetime | None = None
 
     @staticmethod
     def make_id(incident_id: str, version: int) -> str:
         digest = hashlib.sha256(f"{incident_id}:{version}".encode()).hexdigest()[:12]
         return f"INV-{digest}"
+
+
+class _Ref(BaseModel):
+    incident_id: str
+
+
+class _ResolvedRef(BaseModel):
+    incident_id: str
+    at: datetime
 
 
 class CoordinatorDecision(BaseModel):
@@ -135,24 +152,24 @@ class IncidentCoordinator:
         dedup_retention: int = 50_000,
         signal_key_fn: Callable[[StreamEvent, TriggerResult], SignalKey] | None = None,
         processing_mode: str = "live",
+        store: ControlStore | None = None,
+        max_cas_retries: int = 5,
     ) -> None:
         if investigation_cooldown_seconds < 0 or recurrence_window_seconds < 0 or dedup_retention < 1:
             raise ValueError("cooldown and recurrence window must be >= 0 and dedup_retention >= 1")
         if processing_mode not in PROCESSING_MODES:
             raise ValueError(f"processing_mode must be one of {PROCESSING_MODES}")
         self.processing_mode = processing_mode
+        self.store = store or InMemoryControlStore()
+        self.max_cas_retries = max_cas_retries
         self.tenant = tenant
         self.cooldown = timedelta(seconds=investigation_cooldown_seconds)
         self.recurrence_window = timedelta(seconds=recurrence_window_seconds)
         self.dedup_retention = dedup_retention
         self._signal_key_fn = signal_key_fn or self.default_signal_key
 
+        # dedup cache for the hot path; the store is the source of truth
         self._seen: OrderedDict[str, Observation] = OrderedDict()
-        self._quarantine: list[Observation] = []
-        self._incidents: dict[str, Incident] = {}
-        self._open_by_signal: dict[str, str] = {}
-        self._last_resolved: dict[str, tuple[str, datetime]] = {}
-        self._requests: dict[str, InvestigationRequest] = {}
         self._seen_replay: OrderedDict[str, Observation] = OrderedDict()
         self._stats = {
             "observations_accepted": 0,
@@ -202,6 +219,67 @@ class IncidentCoordinator:
             metadata=event.metadata or {},
         )
 
+    # ------------------------------------------------------------------ store access
+
+    OBS, OBS_REPLAY, INCIDENTS, OPEN, RESOLVED, REQUESTS, QUARANTINE = (
+        "observations", "observations_replay", "incidents", "open_signals", "resolved_signals",
+        "investigation_requests", "quarantine",
+    )
+
+    def _load_observation(self, key: str, replay: bool = False) -> Observation | None:
+        cache = self._seen_replay if replay else self._seen
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        row = self.store.get(self.OBS_REPLAY if replay else self.OBS, key)
+        if row is None:
+            return None
+        obs = self.store.materialize(row[0], Observation)
+        cache[key] = obs
+        while len(cache) > self.dedup_retention:
+            cache.popitem(last=False)
+        return obs
+
+    def _save_observation(self, obs: Observation, replay: bool = False) -> None:
+        coll = self.OBS_REPLAY if replay else self.OBS
+        row = self.store.get(coll, obs.identity.key)
+        self.store.put(coll, obs.identity.key, obs, row[1] if row else None)
+
+    def _load_incident(self, incident_id: str) -> tuple[Incident, int]:
+        row = self.store.get(self.INCIDENTS, incident_id)
+        if row is None:
+            raise KeyError(f"unknown incident {incident_id}")
+        return self.store.materialize(row[0], Incident), row[1]
+
+    def _save_incident(self, incident: Incident, row_version: int | None) -> int:
+        return self.store.put(
+            self.INCIDENTS, incident.id, incident, row_version,
+            status="open" if incident.is_open else incident.state.value, scope=incident.signal_key,
+        )
+
+    def _open_incident_id(self, signal_key: str) -> str | None:
+        row = self.store.get(self.OPEN, signal_key)
+        return row[0]["incident_id"] if row and isinstance(row[0], dict) else (
+            self.store.materialize(row[0], _Ref).incident_id if row else None
+        )
+
+    def _last_resolved_for(self, signal_key: str) -> tuple[str, datetime] | None:
+        row = self.store.get(self.RESOLVED, signal_key)
+        if row is None:
+            return None
+        ref = self.store.materialize(row[0], _ResolvedRef)
+        return ref.incident_id, ref.at
+
+    def _with_cas_retry(self, fn):
+        """Run ``fn()`` which performs load → mutate → CAS save; retry on conflict."""
+        last: ConflictError | None = None
+        for _ in range(self.max_cas_retries):
+            try:
+                return fn()
+            except ConflictError as e:
+                last = e
+        raise last  # type: ignore[misc]
+
     # ------------------------------------------------------------------ phase 1: register
 
     def register(self, event: StreamEvent) -> RegistrationResult:
@@ -211,18 +289,17 @@ class IncidentCoordinator:
         historical traffic can never touch live dedup state, frequency counts, indexes or incidents.
         """
         identity = ObservationIdentity(tenant=self.tenant, source=event.source, event_id=event.id)
+        digest = self._hash(event)
         if self.processing_mode == "replay":
             if not event.is_replay:
                 return RegistrationResult(accepted=False, observation_key=identity.key,
                                           reason="live event rejected: coordinator is in replay mode")
-            if identity.key in self._seen_replay:
+            obs = Observation(identity=identity, payload_hash=digest, event_time=event.event_time, replay=True)
+            if not self.store.insert_unique(self.OBS_REPLAY, identity.key, obs, status="replay"):
                 self._stats["duplicate_deliveries"] += 1
                 return RegistrationResult(accepted=False, duplicate=True, replay=True, observation_key=identity.key,
                                           reason="duplicate replay delivery")
-            self._seen_replay[identity.key] = Observation(identity=identity, payload_hash=self._hash(event),
-                                                          event_time=event.event_time, replay=True)
-            while len(self._seen_replay) > self.dedup_retention:
-                self._seen_replay.popitem(last=False)
+            self._seen_replay[identity.key] = obs
             self._stats["replay_observations"] += 1
             return RegistrationResult(accepted=True, replay=True, observation_key=identity.key,
                                       reason="replay observation recorded in the isolated replay namespace")
@@ -230,32 +307,52 @@ class IncidentCoordinator:
             self._stats["replay_rejected"] += 1
             return RegistrationResult(accepted=False, replay=True, observation_key=identity.key,
                                       reason="replay-tagged event rejected in live mode; use a replay-mode coordinator")
-        digest = self._hash(event)
-        prior = self._seen.get(identity.key)
-        if prior is not None:
-            incident = self._incidents.get(prior.incident_id) if prior.incident_id else None
-            if prior.payload_hash == digest:
-                self._stats["duplicate_deliveries"] += 1
-                if incident:
-                    incident.record_duplicate_delivery()
-                return RegistrationResult(
-                    accepted=False, duplicate=True, observation_key=identity.key,
-                    prior_incident_id=prior.incident_id, replay=prior.replay,
-                    reason="duplicate delivery of an already accepted observation",
-                )
-            self._stats["conflicting_deliveries"] += 1
-            self._quarantine.append(Observation(identity=identity, payload_hash=digest, event_time=event.event_time))
-            if incident:
-                incident.record_conflicting_delivery()
-            return RegistrationResult(
-                accepted=False, conflicting=True, observation_key=identity.key,
-                prior_incident_id=prior.incident_id,
-                reason="same observation identity with a different envelope; quarantined",
-            )
+
         observation = Observation(identity=identity, payload_hash=digest, event_time=event.event_time)
-        self._remember(observation)
-        self._stats["observations_accepted"] += 1
-        return RegistrationResult(accepted=True, observation_key=identity.key, reason="observation accepted")
+        # Unique insert is the race arbiter: exactly one worker accepts a given identity.
+        if self.store.insert_unique(self.OBS, identity.key, observation, status="accepted"):
+            self._remember(observation)
+            self._stats["observations_accepted"] += 1
+            return RegistrationResult(accepted=True, observation_key=identity.key, reason="observation accepted")
+
+        prior = self._load_observation(identity.key)
+        if prior is None:  # row vanished (purged) between insert and load; treat as new
+            self._remember(observation)
+            self._save_observation(observation)
+            self._stats["observations_accepted"] += 1
+            return RegistrationResult(accepted=True, observation_key=identity.key, reason="observation accepted")
+        if prior.payload_hash == digest:
+            self._stats["duplicate_deliveries"] += 1
+            if prior.incident_id:
+                self._bump_counter(prior.incident_id, "duplicate")
+            return RegistrationResult(
+                accepted=False, duplicate=True, observation_key=identity.key,
+                prior_incident_id=prior.incident_id,
+                reason="duplicate delivery of an already accepted observation",
+            )
+        self._stats["conflicting_deliveries"] += 1
+        self.store.append(self.QUARANTINE, Observation(identity=identity, payload_hash=digest, event_time=event.event_time))
+        if prior.incident_id:
+            self._bump_counter(prior.incident_id, "conflicting")
+        return RegistrationResult(
+            accepted=False, conflicting=True, observation_key=identity.key,
+            prior_incident_id=prior.incident_id,
+            reason="same observation identity with a different envelope; quarantined",
+        )
+
+    def _bump_counter(self, incident_id: str, kind: str) -> None:
+        def op():
+            incident, rv = self._load_incident(incident_id)
+            if kind == "duplicate":
+                incident.record_duplicate_delivery()
+            else:
+                incident.record_conflicting_delivery()
+            self._save_incident(incident, rv)
+
+        try:
+            self._with_cas_retry(op)
+        except KeyError:
+            pass
 
     # ------------------------------------------------------------------ phase 2: correlate
 
@@ -269,7 +366,7 @@ class IncidentCoordinator:
                 accepted=True, replay=True,
                 reason="replay: observation recorded in the replay namespace; no incident, paging or investigation",
             )
-        observation = self._seen.get(identity_key)
+        observation = self._load_observation(identity_key)
         if observation is None:
             raise ValueError("correlate() requires a registered observation; call register() first")
         if trigger is None or not trigger.fired:
@@ -277,23 +374,30 @@ class IncidentCoordinator:
 
         signal = self._signal_key_fn(event, trigger)
         signature = self.signature(event, trigger)
-        incident_id = self._open_by_signal.get(signal.key)
-        incident = self._incidents.get(incident_id) if incident_id else None
-        if incident is not None and incident.is_open:
-            return self._update_incident(incident, event, signature, observation)
 
-        resolved = self._last_resolved.get(signal.key)
-        if resolved is not None:
-            resolved_id, resolved_at = resolved
-            if event.event_time <= resolved_at:
-                return self._late_evidence(resolved_id, observation)
-        return self._open_incident(event, signal, signature, observation, resolved)
+        def op():
+            with self.store.transaction():
+                incident_id = self._open_incident_id(signal.key)
+                if incident_id is not None:
+                    incident, rv = self._load_incident(incident_id)
+                    if incident.is_open:
+                        return self._update_incident(incident, rv, event, signature, observation)
+                resolved = self._last_resolved_for(signal.key)
+                if resolved is not None:
+                    resolved_id, resolved_at = resolved
+                    if event.event_time <= resolved_at:
+                        return self._late_evidence(resolved_id, observation)
+                return self._open_incident(event, signal, signature, observation, resolved)
+
+        return self._with_cas_retry(op)
 
     def ingest(self, event: StreamEvent, trigger: TriggerResult | None) -> CoordinatorDecision:
         """register() + correlate() for callers with no stateful work in between."""
         registration = self.register(event)
         if not registration.accepted:
-            incident = self._incidents.get(registration.prior_incident_id) if registration.prior_incident_id else None
+            incident = None
+            if registration.prior_incident_id and self.has_incident(registration.prior_incident_id):
+                incident = self.get_incident(registration.prior_incident_id)
             return CoordinatorDecision(
                 accepted=False,
                 duplicate=registration.duplicate,
@@ -309,9 +413,11 @@ class IncidentCoordinator:
     # ------------------------------------------------------------------ incident handling
 
     def _late_evidence(self, incident_id: str, observation: Observation) -> CoordinatorDecision:
-        incident = self._incidents[incident_id]
+        incident, rv = self._load_incident(incident_id)
         incident.record_late_evidence(observation.identity.key)
+        self._save_incident(incident, rv)
         observation.incident_id = incident.id
+        self._save_observation(observation)
         self._stats["late_evidence"] += 1
         return CoordinatorDecision(
             accepted=True, late_evidence=True, incident_id=incident.id,
@@ -348,12 +454,14 @@ class IncidentCoordinator:
         if related:
             incident.attributes["related_incident"] = related
         incident.attach_observation(observation.identity.key, signature)
+        # The open-signal row is the race arbiter for episode creation: one winner per signal key.
+        if not self.store.insert_unique(self.OPEN, signal.key, _Ref(incident_id=incident.id)):
+            raise ConflictError(f"another worker opened an incident for {signal.key}")
         observation.incident_id = incident.id
-        self._incidents[incident.id] = incident
-        self._open_by_signal[signal.key] = incident.id
+        self._save_observation(observation)
         self._stats["incidents_created"] += 1
-
         request = self._request_investigation(incident, reason)
+        self._save_incident(incident, None)
         return CoordinatorDecision(
             accepted=True,
             incident_id=incident.id,
@@ -365,12 +473,13 @@ class IncidentCoordinator:
         )
 
     def _update_incident(
-        self, incident: Incident, event: StreamEvent, signature: str, observation: Observation
+        self, incident: Incident, row_version: int, event: StreamEvent, signature: str, observation: Observation
     ) -> CoordinatorDecision:
         previous_severity = incident.severity
         known_signature = signature in incident.signatures
         incident.attach_observation(observation.identity.key, signature)
         observation.incident_id = incident.id
+        self._save_observation(observation)
 
         change = MaterialChange.NONE
         if SEVERITY_ORDER[event.severity] > SEVERITY_ORDER[previous_severity]:
@@ -382,6 +491,7 @@ class IncidentCoordinator:
             change = MaterialChange.COOLDOWN_ELAPSED
 
         if change is MaterialChange.NONE:
+            self._save_incident(incident, row_version)
             self._stats["evidence_only_updates"] += 1
             return CoordinatorDecision(
                 accepted=True,
@@ -393,6 +503,7 @@ class IncidentCoordinator:
             )
 
         request = self._request_investigation(incident, change)
+        self._save_incident(incident, row_version)
         return CoordinatorDecision(
             accepted=True,
             incident_id=incident.id,
@@ -405,9 +516,6 @@ class IncidentCoordinator:
 
     def _request_investigation(self, incident: Incident, reason: MaterialChange) -> InvestigationRequest:
         request_id = InvestigationRequest.make_id(incident.id, incident.version)
-        existing = self._requests.get(request_id)
-        if existing:
-            return existing  # two workers on the same transition → one durable request
         request = InvestigationRequest(
             id=request_id,
             incident_id=incident.id,
@@ -415,10 +523,59 @@ class IncidentCoordinator:
             reason=reason,
             context={"signal_key": incident.signal_key, "severity": incident.severity.value},
         )
-        self._requests[request_id] = request
+        # Unique id = (incident, version): two workers on the same transition → one durable request.
+        if not self.store.insert_unique(self.REQUESTS, request_id, request, status="queued", scope=incident.id):
+            return self.get_request(request_id)
         incident.mark_investigated()
         self._stats["investigations_requested"] += 1
         return request
+
+    # ------------------------------------------------------------------ investigation work lifecycle (R16)
+
+    def get_request(self, request_id: str) -> InvestigationRequest:
+        row = self.store.get(self.REQUESTS, request_id)
+        if row is None:
+            raise KeyError(f"unknown investigation request {request_id}")
+        return self.store.materialize(row[0], InvestigationRequest)
+
+    def claim_investigation(self, request_id: str, worker: str, lease_seconds: int = 300) -> InvestigationRequest | None:
+        """Lease a queued (or failed / lease-expired) request to one worker. None when unavailable."""
+        claimed = self.store.claim(self.REQUESTS, request_id, worker, lease_seconds, from_statuses=("queued", "failed"))
+        if claimed is None:
+            return None
+        request = self.store.materialize(claimed[0], InvestigationRequest)
+        request.status = "running"
+        request.attempts += 1
+        request.lease_owner = worker
+        request.lease_until = _now() + timedelta(seconds=lease_seconds)
+        self.store.put(self.REQUESTS, request_id, request, claimed[1], status="running", scope=request.incident_id)
+        return request
+
+    def complete_investigation(self, request_id: str, worker: str, succeeded: bool, summary: str = "") -> InvestigationRequest:
+        """Record the outcome of leased work. A stale lease (another worker claimed it) is refused."""
+        row = self.store.get(self.REQUESTS, request_id)
+        if row is None:
+            raise KeyError(f"unknown investigation request {request_id}")
+        request = self.store.materialize(row[0], InvestigationRequest)
+        if request.status != "running" or request.lease_owner != worker:
+            raise ConflictError(f"{request_id}: not leased by {worker} (status {request.status}, owner {request.lease_owner})")
+        request.status = "succeeded" if succeeded else "failed"
+        request.result_summary = summary[:500] if summary else None
+        request.completed_at = _now()
+        request.lease_owner = None
+        request.lease_until = None
+        self.store.put(self.REQUESTS, request_id, request, row[1], status=request.status, scope=request.incident_id)
+        return request
+
+    def pending_investigations(self, limit: int | None = None) -> list[InvestigationRequest]:
+        rows = self.store.list(self.REQUESTS, status="queued", limit=limit) + self.store.list(self.REQUESTS, status="failed", limit=limit)
+        return [self.store.materialize(doc, InvestigationRequest) for _, doc, _ in rows]
+
+    def is_request_stale(self, request_id: str) -> bool:
+        """True when the incident's evidence moved past the snapshot the request was made for."""
+        request = self.get_request(request_id)
+        incident = self.get_incident(request.incident_id)
+        return incident.version != request.evidence_snapshot_version
 
     # ------------------------------------------------------------------ lifecycle operations
 
@@ -426,13 +583,21 @@ class IncidentCoordinator:
         """Apply an explicit, recorded lifecycle transition (the only way state changes)."""
         if not actor:
             raise ValueError("a transition requires an actor")
-        incident = self.get_incident(incident_id)
-        incident.transition(to, actor=actor, reason=reason)
-        if not incident.is_open:
-            self._open_by_signal.pop(incident.signal_key, None)
-            if to is IncidentState.RESOLVED:
-                self._last_resolved[incident.signal_key] = (incident.id, _now())
-        return incident
+
+        def op():
+            with self.store.transaction():
+                incident, rv = self._load_incident(incident_id)
+                incident.transition(to, actor=actor, reason=reason)
+                self._save_incident(incident, rv)
+                if not incident.is_open:
+                    open_row = self.store.get(self.OPEN, incident.signal_key)
+                    if open_row and self.store.materialize(open_row[0], _Ref).incident_id == incident.id:
+                        self.store.delete(self.OPEN, incident.signal_key)
+                    if to is IncidentState.RESOLVED:
+                        self.store.put(self.RESOLVED, incident.signal_key, _ResolvedRef(incident_id=incident.id, at=_now()), None)
+                return incident
+
+        return self._with_cas_retry(op)
 
     def record_verification(
         self,
@@ -446,60 +611,71 @@ class IncidentCoordinator:
         Simulated evidence is accepted only by a coordinator in ``simulation`` mode; a live
         coordinator refuses it so a fixture can never authorize a live RESOLVED.
         """
-        incident = self.get_incident(incident_id)
         if result.simulated and self.processing_mode != "simulation":
             raise InvalidTransition(f"{incident_id}: simulated verification evidence is not accepted in {self.processing_mode} mode")
         if result.healthy is None:
-            return incident  # unknown: recorded nowhere as success
-        incident.record_verification(
-            VerificationRecord(
-                healthy=result.healthy, at_version=incident.version, operation_id=operation_id,
-                source=result.source, window=result.window, signals=list(result.signals),
-                simulated=result.simulated, verified_by=verified_by,
+            return self.get_incident(incident_id)  # unknown: recorded nowhere as success
+
+        def op():
+            incident, rv = self._load_incident(incident_id)
+            incident.record_verification(
+                VerificationRecord(
+                    healthy=result.healthy, at_version=incident.version, operation_id=operation_id,
+                    source=result.source, window=result.window, signals=list(result.signals),
+                    simulated=result.simulated, verified_by=verified_by,
+                )
             )
-        )
+            self._save_incident(incident, rv)
+            return incident
+
+        incident = self._with_cas_retry(op)
         self._stats["verifications_recorded"] += 1
         return incident
 
     def link_external(self, incident_id: str, system: str, external_id: str) -> None:
         """Durable mapping to an external incident/ticket. Never search-by-title-and-create."""
-        self.get_incident(incident_id).external_refs[system] = external_id
+
+        def op():
+            incident, rv = self._load_incident(incident_id)
+            incident.external_refs[system] = external_id
+            self._save_incident(incident, rv)
+
+        self._with_cas_retry(op)
 
     # ------------------------------------------------------------------ accessors
 
     def get_incident(self, incident_id: str) -> Incident:
-        try:
-            return self._incidents[incident_id]
-        except KeyError:
-            raise KeyError(f"unknown incident {incident_id}") from None
+        return self._load_incident(incident_id)[0]
 
     def has_incident(self, incident_id: str) -> bool:
-        return incident_id in self._incidents
+        return self.store.get(self.INCIDENTS, incident_id) is not None
 
     @property
     def incidents(self) -> list[Incident]:
-        return list(self._incidents.values())
+        return [self.store.materialize(doc, Incident) for _, doc, _ in self.store.list(self.INCIDENTS)]
 
     @property
     def open_incidents(self) -> list[Incident]:
-        return [i for i in self._incidents.values() if i.is_open]
+        return [self.store.materialize(doc, Incident) for _, doc, _ in self.store.list(self.INCIDENTS, status="open")]
 
     @property
     def investigation_requests(self) -> list[InvestigationRequest]:
-        return list(self._requests.values())
+        return [self.store.materialize(doc, InvestigationRequest) for _, doc, _ in self.store.list(self.REQUESTS)]
 
     @property
     def quarantine(self) -> list[Observation]:
-        return list(self._quarantine)
+        log = getattr(self.store, "log", None)
+        return [self.store.materialize(d, Observation) for d in log(self.QUARANTINE)] if log else []
 
     @property
     def stats(self) -> dict[str, Any]:
         return {
             **self._stats,
-            "open_incidents": len(self.open_incidents),
-            "total_incidents": len(self._incidents),
-            "quarantined": len(self._quarantine),
+            "open_incidents": len(self.store.list(self.INCIDENTS, status="open")),
+            "total_incidents": self.store.count(self.INCIDENTS),
+            "quarantined": len(self.quarantine),
             "dedup_cache_size": len(self._seen),
+            "store": type(self.store).__name__,
         }
 
     # ------------------------------------------------------------------ internals

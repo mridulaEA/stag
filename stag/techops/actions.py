@@ -32,6 +32,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from stag.techops.store import ControlStore, InMemoryControlStore
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -178,18 +180,39 @@ class ActionRecord(BaseModel):
 class ActionLedger:
     """Durable record of every remediation operation and its outcome (in-memory reference impl)."""
 
-    def __init__(self, max_staleness_versions: int = 0, max_retries: int = 1) -> None:
+    COLLECTION = "actions"
+
+    def __init__(self, max_staleness_versions: int = 0, max_retries: int = 1, store: ControlStore | None = None) -> None:
         """
         max_staleness_versions: incident versions that may pass between authorization and dispatch
             before re-approval is required. 0 means any change makes the approval stale.
         max_retries: explicit retries allowed after a reconciliation proved the effect absent. The
             ceiling is cumulative for the operation: re-approval does not replenish it.
+        store: control store holding the records (in-memory by default; SQL for durability).
         """
         if int(max_staleness_versions) < 0 or int(max_retries) < 0:
             raise ValueError("max_staleness_versions and max_retries must be >= 0")
-        self._records: dict[str, ActionRecord] = {}
+        self.store = store or InMemoryControlStore()
         self.max_staleness_versions = int(max_staleness_versions)
         self.max_retries = int(max_retries)
+
+    # ----------------------------------------------------------------- persistence
+    def _load(self, operation_id: str) -> tuple[ActionRecord, int]:
+        row = self.store.get(self.COLLECTION, operation_id)
+        if row is None:
+            raise KeyError(f"unknown operation {operation_id}")
+        return self.store.materialize(row[0], ActionRecord), row[1]
+
+    def _save(self, record: ActionRecord, row_version: int | None) -> None:
+        self.store.put(self.COLLECTION, record.operation_id, record, row_version, status=record.state.value, scope=record.incident_id)
+
+    def _commit(self, operation_id: str, mutate) -> ActionRecord:
+        """Load → mutate (may raise) → CAS save. The record returned is the stored object for the
+        in-memory store and a fresh copy for SQL stores."""
+        record, rv = self._load(operation_id)
+        mutate(record)
+        self._save(record, rv)
+        return record
 
     # ----------------------------------------------------------------- integrity
 
@@ -213,13 +236,14 @@ class ActionLedger:
         """Audited extension of one operation's retry allowance. Never implicit."""
         if by < 1 or not authorized_by:
             raise ValueError("a retry-budget extension needs a positive amount and an authorizer")
-        record = self._record(operation_id)
-        record.retry_budget_extension += int(by)
-        record.history.append(
-            ActionEvent(from_state=record.state, to_state=record.state, actor=authorized_by,
-                        note=note or f"retry budget extended by {by}")
-        )
-        return record
+        def mutate(record: ActionRecord) -> None:
+            record.retry_budget_extension += int(by)
+            record.history.append(
+                ActionEvent(from_state=record.state, to_state=record.state, actor=authorized_by,
+                            note=note or f"retry budget extended by {by}")
+            )
+
+        return self._commit(operation_id, mutate)
 
     # ----------------------------------------------------------------- lifecycle
 
@@ -237,11 +261,6 @@ class ActionLedger:
         preconditions = list(preconditions or [])
         terms = ActionRecord.terms(incident_id, plan_step, target, parameters, policy_version, preconditions)
         op_id = "OP-" + terms[:12]
-        existing = self._records.get(op_id)
-        if existing is not None:
-            if existing.terms_hash != terms:  # defensive: id prefix collision with different terms
-                raise InvalidActionTransition(f"{op_id}: operation id collides with different terms")
-            return existing
         record = ActionRecord(
             operation_id=op_id,
             incident_id=incident_id,
@@ -252,80 +271,91 @@ class ActionLedger:
             preconditions=preconditions,
             terms_hash=terms,
         )
-        self._records[op_id] = record
-        return record
+        if self.store.insert_unique(self.COLLECTION, op_id, record, status=record.state.value, scope=incident_id):
+            return record
+        existing, _ = self._load(op_id)
+        if existing.terms_hash != terms:  # defensive: id prefix collision with different terms
+            raise InvalidActionTransition(f"{op_id}: operation id collides with different terms")
+        return existing
 
     def authorize(self, operation_id: str, actor: str, incident_version: int, note: str = "") -> ActionRecord:
         """Bind an explicit approval to the exact terms and the incident evidence version."""
         if not actor:
             raise ValueError("authorization requires an actor")
-        record = self._record(operation_id)
-        self._check_integrity(record)
-        record._move(ActionState.AUTHORIZED, actor, note or "approved")
-        record.authorized_by = actor
-        record.authorized_at_incident_version = int(incident_version)
-        record.authorized_at = _now()
-        return record
+        def mutate(record: ActionRecord) -> None:
+            self._check_integrity(record)
+            record._move(ActionState.AUTHORIZED, actor, note or "approved")
+            record.authorized_by = actor
+            record.authorized_at_incident_version = int(incident_version)
+            record.authorized_at = _now()
+
+        return self._commit(operation_id, mutate)
 
     def reject(self, operation_id: str, actor: str, note: str = "") -> ActionRecord:
-        record = self._record(operation_id)
-        record._move(ActionState.REJECTED, actor, note)
-        return record
+        return self._commit(operation_id, lambda r: r._move(ActionState.REJECTED, actor, note))
 
     def revalidate(self, operation_id: str, current_incident_version: int, actor: str = "system") -> ActionRecord:
         """Before dispatch, confirm the approval is not stale relative to the incident's evidence."""
-        record = self._record(operation_id)
-        if record.state not in DISPATCHABLE_STATES:
-            return record
-        authorized_at = record.authorized_at_incident_version
-        if authorized_at is None or current_incident_version < authorized_at:
-            record._move(ActionState.STALE, actor, "approval version is missing or ahead of the incident; re-approval required")
-            return record
-        drift = current_incident_version - authorized_at
-        if drift > self.max_staleness_versions:
-            record._move(ActionState.STALE, actor, f"incident moved {drift} version(s) since authorization; re-approval required")
-        return record
+        def mutate(record: ActionRecord) -> None:
+            if record.state not in DISPATCHABLE_STATES:
+                return
+            authorized_at = record.authorized_at_incident_version
+            if authorized_at is None or current_incident_version < authorized_at:
+                record._move(ActionState.STALE, actor, "approval version is missing or ahead of the incident; re-approval required")
+                return
+            drift = current_incident_version - authorized_at
+            if drift > self.max_staleness_versions:
+                record._move(ActionState.STALE, actor, f"incident moved {drift} version(s) since authorization; re-approval required")
+
+        return self._commit(operation_id, mutate)
 
     def dispatch(self, operation_id: str, actor: str = "executor", current_incident_version: int | None = None) -> ActionRecord:
         """Dispatch from AUTHORIZED, or retry once from RETRY_READY. Never from an uncertain state.
 
         When ``current_incident_version`` is given, freshness is revalidated first.
         """
-        record = self._record(operation_id)
-        self._check_integrity(record)  # before any state change or attempt count
+        self._check_integrity(self._load(operation_id)[0])  # before any state change or attempt count
         if current_incident_version is not None:
-            self.revalidate(operation_id, current_incident_version, actor=actor)
-        if record.state not in DISPATCHABLE_STATES:
-            raise InvalidActionTransition(
-                f"{operation_id}: cannot dispatch from {record.state.value}; "
-                "only authorized or retry_ready operations are dispatchable"
-            )
-        if record.dispatch_attempts >= self._attempt_ceiling(record):
-            raise RetryBudgetExceeded(
-                f"{operation_id}: cumulative dispatch ceiling ({self._attempt_ceiling(record)}) reached; "
-                "re-approval does not replenish it — record an explicit retry-budget extension"
-            )
-        note = "retry after reconciliation proved the effect absent" if record.state is ActionState.RETRY_READY else "dispatched"
-        record._move(ActionState.DISPATCHED, actor, note)
-        record.dispatch_attempts += 1
-        record.last_dispatched_at = _now()
-        return record
+            record = self.revalidate(operation_id, current_incident_version, actor=actor)
+            if record.state is ActionState.STALE:
+                raise InvalidActionTransition(f"{operation_id}: cannot dispatch from stale; only authorized or retry_ready operations are dispatchable")
+
+        def mutate(record: ActionRecord) -> None:
+            self._check_integrity(record)
+            if record.state not in DISPATCHABLE_STATES:
+                raise InvalidActionTransition(
+                    f"{operation_id}: cannot dispatch from {record.state.value}; "
+                    "only authorized or retry_ready operations are dispatchable"
+                )
+            if record.dispatch_attempts >= self._attempt_ceiling(record):
+                raise RetryBudgetExceeded(
+                    f"{operation_id}: cumulative dispatch ceiling ({self._attempt_ceiling(record)}) reached; "
+                    "re-approval does not replenish it — record an explicit retry-budget extension"
+                )
+            note = "retry after reconciliation proved the effect absent" if record.state is ActionState.RETRY_READY else "dispatched"
+            record._move(ActionState.DISPATCHED, actor, note)
+            record.dispatch_attempts += 1
+            record.last_dispatched_at = _now()
+
+        return self._commit(operation_id, mutate)
 
     def mark_applied(self, operation_id: str, actor: str = "executor", receipt: dict[str, Any] | None = None) -> ActionRecord:
         """The destination confirmed the change was applied. Not recovery: verification still required."""
-        record = self._record(operation_id)
-        self._check_integrity(record)
-        record._move(ActionState.APPLIED, actor, "destination confirmed application")
-        if receipt:
-            record.verification["application_receipt"] = receipt
-        return record
+        def mutate(record: ActionRecord) -> None:
+            self._check_integrity(record)
+            record._move(ActionState.APPLIED, actor, "destination confirmed application")
+            if receipt:
+                record.verification["application_receipt"] = receipt
+
+        return self._commit(operation_id, mutate)
 
     def mark_outcome_unknown(self, operation_id: str, actor: str = "executor", note: str = "") -> ActionRecord:
         """The response was lost or timed out. Not a failure, not a success: reconcile."""
-        record = self._record(operation_id)
-        record._move(ActionState.OUTCOME_UNKNOWN, actor, note or "response lost or timed out")
-        record._move(ActionState.RECONCILING, "system", "reconciliation started")
-        return record
+        def mutate(record: ActionRecord) -> None:
+            record._move(ActionState.OUTCOME_UNKNOWN, actor, note or "response lost or timed out")
+            record._move(ActionState.RECONCILING, "system", "reconciliation started")
+
+        return self._commit(operation_id, mutate)
 
     def reconcile(
         self, operation_id: str, target_state_observed: bool, actor: str = "reconciler", note: str = ""
@@ -335,14 +365,15 @@ class ActionLedger:
         Observed → APPLIED (verification still required). Absent → RETRY_READY; the retry itself is
         a separate, explicit ``dispatch`` that re-checks freshness and the retry budget.
         """
-        record = self._record(operation_id)
-        if record.state is not ActionState.RECONCILING:
-            raise InvalidActionTransition(f"{operation_id} is not reconciling")
-        if target_state_observed:
-            record._move(ActionState.APPLIED, actor, note or "target state confirms the operation applied")
-        else:
-            record._move(ActionState.RETRY_READY, actor, note or "target shows no effect; one explicit retry permitted")
-        return record
+        def mutate(record: ActionRecord) -> None:
+            if record.state is not ActionState.RECONCILING:
+                raise InvalidActionTransition(f"{operation_id} is not reconciling")
+            if target_state_observed:
+                record._move(ActionState.APPLIED, actor, note or "target state confirms the operation applied")
+            else:
+                record._move(ActionState.RETRY_READY, actor, note or "target shows no effect; one explicit retry permitted")
+
+        return self._commit(operation_id, mutate)
 
     def verify(
         self,
@@ -365,54 +396,50 @@ class ActionLedger:
         )
         if result.healthy is not healthy:
             result = result.model_copy(update={"healthy": healthy})
-        record = self._record(operation_id)
-        self._check_integrity(record)
-        if healthy is None:
-            if record.is_terminal:
-                raise InvalidActionTransition(f"{operation_id} is terminal ({record.state.value})")
-            attempts = record.verification.setdefault("unknown_verdicts", [])
-            attempts.append(result.model_dump(mode="json"))
-            return result
-        target = ActionState.VERIFIED if healthy else ActionState.FAILED
-        if not record._can(target):
-            raise InvalidActionTransition(f"{operation_id}: {record.state.value} → {target.value} is not permitted")
-        record.verification = {
-            **{k: v for k, v in record.verification.items() if k in ("application_receipt", "unknown_verdicts")},
-            **result.model_dump(mode="json"),
-            "healthy": bool(healthy),
-            "verified_at": _now().isoformat(),
-            "verified_by": actor,
-        }
-        record._move(target, actor, "health checks passed over observation window" if healthy else "health checks did not confirm recovery")
+        def mutate(record: ActionRecord) -> None:
+            self._check_integrity(record)
+            if healthy is None:
+                if record.is_terminal:
+                    raise InvalidActionTransition(f"{operation_id} is terminal ({record.state.value})")
+                record.verification.setdefault("unknown_verdicts", []).append(result.model_dump(mode="json"))
+                return
+            target = ActionState.VERIFIED if healthy else ActionState.FAILED
+            if not record._can(target):
+                raise InvalidActionTransition(f"{operation_id}: {record.state.value} → {target.value} is not permitted")
+            record.verification = {
+                **{k: v for k, v in record.verification.items() if k in ("application_receipt", "unknown_verdicts")},
+                **result.model_dump(mode="json"),
+                "healthy": bool(healthy),
+                "verified_at": _now().isoformat(),
+                "verified_by": actor,
+            }
+            record._move(target, actor, "health checks passed over observation window" if healthy else "health checks did not confirm recovery")
+
+        self._commit(operation_id, mutate)
         return result
 
     # ----------------------------------------------------------------- accessors
 
-    def _record(self, operation_id: str) -> ActionRecord:
-        try:
-            return self._records[operation_id]
-        except KeyError:
-            raise KeyError(f"unknown operation {operation_id}") from None
-
     def get(self, operation_id: str) -> ActionRecord:
-        """The live record. Mutating it outside ledger commands breaks its integrity digest and
-        every later command (authorize, dispatch, verify) refuses it."""
-        return self._record(operation_id)
+        """The stored record (same object for the in-memory store; a fresh copy for SQL stores).
+        Mutating it outside ledger commands breaks its integrity digest and every later command
+        (authorize, dispatch, verify) refuses it."""
+        return self._load(operation_id)[0]
 
     def view(self, operation_id: str) -> ActionRecord:
         """A detached, read-only copy for API responses and reports."""
-        return self._record(operation_id).model_copy(deep=True)
+        return self._load(operation_id)[0].model_copy(deep=True)
 
     def for_incident(self, incident_id: str) -> list[ActionRecord]:
-        return [r for r in self._records.values() if r.incident_id == incident_id]
+        return [self.store.materialize(doc, ActionRecord) for _, doc, _ in self.store.list(self.COLLECTION, scope=incident_id)]
 
     @property
     def records(self) -> list[ActionRecord]:
-        return list(self._records.values())
+        return [self.store.materialize(doc, ActionRecord) for _, doc, _ in self.store.list(self.COLLECTION)]
 
     @property
     def stats(self) -> dict[str, Any]:
         by_state: dict[str, int] = {}
-        for r in self._records.values():
+        for r in self.records:
             by_state[r.state.value] = by_state.get(r.state.value, 0) + 1
-        return {"operations": len(self._records), "by_state": by_state}
+        return {"operations": self.store.count(self.COLLECTION), "by_state": by_state}

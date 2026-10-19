@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     techops_dedup_retention: int = 50000
     techops_processing_mode: Literal["live", "replay"] = "live"
     index_timeout_seconds: float = 5.0
+    # Durable control state (observations, incidents, investigation requests, action ledger).
+    # "" or "memory://" → process-local (lost on restart); "sqlite:///./data/control.sqlite" → single
+    # host, survives restarts; "postgresql://user:pass@host/db" → multi-worker (needs psycopg).
+    control_store_url: str = ""
+    # Identifies this worker when leasing investigation requests; defaults to "<hostname>:<pid>".
+    techops_worker_id: str = ""
+    techops_investigation_lease_seconds: int = 300
 
     # Simulator
     simulator_interval: float = 3.0

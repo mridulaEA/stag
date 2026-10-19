@@ -13,6 +13,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - CHROMA_PERSIST_DIR=/app/data/chroma
       - GRAPH_PERSIST_PATH=/app/data/graph.json
+      - CONTROL_STORE_URL=sqlite:////app/data/control.sqlite
     volumes:
       - stag-data:/app/data
     restart: unless-stopped

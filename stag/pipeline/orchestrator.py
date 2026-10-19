@@ -8,6 +8,8 @@ a trigger fires, and generates actionable insights.
 from __future__ import annotations
 
 import asyncio
+import os
+import socket
 import time
 from collections import deque
 
@@ -52,6 +54,10 @@ class PipelineOrchestrator:
         # Optional TechOps coordinator: dedup + incident correlation + investigation cadence.
         # When present, a fired trigger only reaches the LLM on a *material* incident change.
         self.coordinator = coordinator
+        # Investigation work is leased to one worker at a time (R16). Several workers sharing a
+        # durable control store can race on the same request; only the lease holder generates.
+        self.worker_id = getattr(settings, "techops_worker_id", "") or f"{socket.gethostname()}:{os.getpid()}"
+        self.investigation_lease_seconds = int(getattr(settings, "techops_investigation_lease_seconds", 300))
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -255,6 +261,24 @@ class PipelineOrchestrator:
             )
             return
 
+        # Step 3c (TechOps): lease the investigation request before any model work. If another
+        # worker holds it (or already finished it), this worker does not generate a second time.
+        request = decision.investigation_request if decision is not None else None
+        if request is not None and self.coordinator is not None:
+            claimed = self.coordinator.claim_investigation(request.id, self.worker_id, self.investigation_lease_seconds)
+            if claimed is None:
+                self._suppressed_count += 1
+                logger.info("pipeline.investigation_not_claimed", request_id=request.id, worker=self.worker_id)
+                await self._emit(
+                    {
+                        "type": "incident_update",
+                        "event": event.model_dump(mode="json"),
+                        "trigger": trigger.model_dump(mode="json"),
+                        "decision": {**decision.model_dump(mode="json"), "reason": "investigation request leased by another worker"},
+                    }
+                )
+                return
+
         # Step 4: Hybrid retrieval — enrichment; failure degrades, never suppresses the detection
         query = self._build_retrieval_query(event, trigger)
         try:
@@ -280,6 +304,19 @@ class PipelineOrchestrator:
                 degraded_reason=str(e)[:200],
             )
         self._insight_count += 1
+
+        # Step 5b (TechOps): close the lease with the outcome. A degraded insight is a failed
+        # investigation (the request stays claimable); a stale lease is reported, never overwritten.
+        if request is not None and self.coordinator is not None:
+            try:
+                self.coordinator.complete_investigation(
+                    request.id,
+                    self.worker_id,
+                    succeeded=insight.generation_mode != "degraded",
+                    summary=insight.title,
+                )
+            except Exception as e:
+                logger.warning("pipeline.investigation_completion_refused", request_id=request.id, error=str(e))
 
         elapsed = (time.time() - start) * 1000
 

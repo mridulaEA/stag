@@ -32,6 +32,34 @@ jobs:
       - name: Test TechOps backbone, triggers, skills tooling, crews, API
         run: python -m pytest tests/test_techops.py tests/test_triggers.py tests/test_skills.py tests/test_crews.py tests/test_techops_api.py -q
 
+  durable-store:
+    name: Control store (SQLite + PostgreSQL)
+    runs-on: ubuntu-latest
+    needs: core
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: stag
+          POSTGRES_DB: stag
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      STAG_TEST_POSTGRES_DSN: postgresql://postgres:stag@localhost:5432/stag
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install core dependencies plus psycopg
+        run: |
+          python -m pip install --upgrade pip
+          pip install pydantic pydantic-settings structlog pyyaml fastapi httpx pytest pytest-asyncio "psycopg[binary]"
+      - name: Store contract, durability, leases, two-process race (SQLite) and PostgreSQL parity
+        run: python -m pytest tests/test_control_store.py tests/test_control_store_postgres.py tests/test_orchestrator_techops.py -q -rs
+
   packaging:
     name: Installed-package catalogs
     runs-on: ubuntu-latest

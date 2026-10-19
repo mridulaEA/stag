@@ -172,3 +172,16 @@ def test_crews_catalog_and_dry_run(client):
     assert bad.status_code == 422
     # dry runs never touch the live coordinator
     assert client.get("/api/techops/incidents").json()["stats"]["total_incidents"] == 1
+
+
+def test_investigation_lifecycle_is_visible_over_api(client):
+    body = client.get("/api/techops/investigations").json()["investigations"]
+    assert len(body) == 1 and body[0]["status"] == "queued" and body[0]["attempts"] == 0
+    assert len(client.get("/api/techops/investigations?pending=true").json()["investigations"]) == 1
+    detail = client.get(f"/api/techops/investigations/{body[0]['id']}").json()
+    assert detail["investigation"]["id"] == body[0]["id"] and detail["stale"] is False
+    # evidence moves on → the queued request is reported stale
+    inc = client.get("/api/techops/incidents").json()["incidents"][0]
+    client.post(f"/api/techops/incidents/{inc['id']}/transition", json={"to": "triaged", "actor": "oncall", "reason": "r"})
+    assert client.get(f"/api/techops/investigations/{body[0]['id']}").json()["stale"] is True
+    assert client.get("/api/techops/investigations/INV-nope").status_code == 404
