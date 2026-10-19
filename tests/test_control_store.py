@@ -12,6 +12,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import sys
+import traceback
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -324,60 +325,85 @@ class TestInvestigationLifecycle:
 # --------------------------------------------------------------------------- two processes, one SQLite file
 
 
-def _race_register(args):
-    url, event_json, start_at = args
+def _wait_until(start_at: float) -> None:
     import time
 
-    from stag.models import StreamEvent
-    from stag.techops import ActionLedger, IncidentCoordinator
-    from stag.techops.store import SqlControlStore
-
-    event = StreamEvent.model_validate_json(event_json)
-    store = SqlControlStore(url)
-    coord = IncidentCoordinator(store=store)
-    ledger = ActionLedger(store=store)
     while time.time() < start_at:
         time.sleep(0.001)
-    reg = coord.register(event)
-    trig = TriggerResult(trigger_type=TriggerType.THRESHOLD, rule_name="r", fired=True, confidence=0.9, event_id=event.id, reason="t")
-    decision = coord.correlate(event, trig, reg) if reg.accepted else None
-    incident_id = decision.incident_id if decision else (reg.prior_incident_id or next(iter(coord.open_incidents)).id)
-    op = ledger.prepare(incident_id, "restart", "checkout-api", {"replicas": 2})
-    claimed = coord.claim_investigation(decision.investigation_request.id, f"w{start_at}", 300) if decision and decision.investigation_request else None
-    store.close()
-    return {
-        "accepted": reg.accepted,
-        "duplicate": reg.duplicate,
-        "incident_id": incident_id,
-        "request_id": decision.investigation_request.id if decision and decision.investigation_request else None,
-        "op": op.operation_id,
-        "claimed": claimed is not None,
-    }
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="fork-based multiprocessing")
+def _race_phase1(args):
+    """Phase 1: four processes deliver the same event at once. Exactly one may register it.
+
+    A loser may observe the duplicate in the window between the winner's observation commit and
+    its incident commit (two transactions by design), so losers never look the incident up here;
+    the parent checks the single-incident invariant after both phases.
+    """
+    url, event_json, start_at = args
+    try:
+        from stag.models import StreamEvent
+        from stag.techops import IncidentCoordinator
+        from stag.techops.store import SqlControlStore
+
+        event = StreamEvent.model_validate_json(event_json)
+        store = SqlControlStore(url)
+        coord = IncidentCoordinator(store=store)
+        _wait_until(start_at)
+        reg = coord.register(event)
+        out = {"accepted": reg.accepted, "duplicate": reg.duplicate, "incident_id": None, "request_id": None}
+        if reg.accepted:
+            decision = coord.correlate(event, _trigger(event), reg)
+            out["incident_id"] = decision.incident_id
+            out["request_id"] = decision.investigation_request.id
+        store.close()
+        return out
+    except BaseException:  # a StopIteration here would otherwise be swallowed by Pool.map
+        return {"error": traceback.format_exc()}
+
+
+def _race_phase2(args):
+    """Phase 2: four processes prepare the same operation and claim the same request at once."""
+    url, incident_id, request_id, start_at = args
+    try:
+        from stag.techops import ActionLedger, IncidentCoordinator
+        from stag.techops.store import SqlControlStore
+
+        store = SqlControlStore(url)
+        ledger = ActionLedger(store=store)
+        coord = IncidentCoordinator(store=store)
+        _wait_until(start_at)
+        op = ledger.prepare(incident_id, "restart", "checkout-api", {"replicas": 2})
+        claimed = coord.claim_investigation(request_id, f"worker-{os.getpid()}", 300)
+        store.close()
+        return {"op": op.operation_id, "claimed": claimed is not None}
+    except BaseException:
+        return {"error": traceback.format_exc()}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="spawn-based multiprocessing on POSIX only")
 def test_two_processes_one_registration_one_incident_one_operation(tmp_path):
     import time
 
     url = f"sqlite:///{tmp_path / 'race.sqlite'}"
     SqlControlStore(url).close()  # create schema once
     ev = _event()
-    start_at = time.time() + 0.5
     ctx = mp.get_context("spawn")
     with ctx.Pool(4) as pool:
-        results = pool.map(_race_register, [(url, ev.model_dump_json(), start_at)] * 4)
+        phase1 = pool.map(_race_phase1, [(url, ev.model_dump_json(), time.time() + 0.5)] * 4)
+        assert not [r for r in phase1 if "error" in r], phase1
+        accepted = [r for r in phase1 if r["accepted"]]
+        assert len(accepted) == 1, phase1
+        assert all(r["duplicate"] for r in phase1 if not r["accepted"])
+        incident_id, request_id = accepted[0]["incident_id"], accepted[0]["request_id"]
 
-    accepted = [r for r in results if r["accepted"]]
-    assert len(accepted) == 1, results
-    assert all(r["duplicate"] for r in results if not r["accepted"])
-    assert len({r["incident_id"] for r in results}) == 1
-    assert len({r["op"] for r in results}) == 1
-    assert sum(1 for r in results if r["claimed"]) == 1
+        phase2 = pool.map(_race_phase2, [(url, incident_id, request_id, time.time() + 0.5)] * 4)
+        assert not [r for r in phase2 if "error" in r], phase2
+        assert len({r["op"] for r in phase2}) == 1, phase2
+        assert sum(1 for r in phase2 if r["claimed"]) == 1, phase2
 
     store = SqlControlStore(url)
     coord = IncidentCoordinator(store=store)
     assert len(coord.incidents) == 1
-    assert len(coord.investigation_requests) == 1
-    assert coord.investigation_requests[0].status == "running"
+    assert [r.status for r in coord.investigation_requests] == ["running"]
     assert ActionLedger(store=store).stats["operations"] == 1
     store.close()
