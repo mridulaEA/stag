@@ -58,7 +58,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pydantic pydantic-settings structlog pyyaml fastapi httpx pytest pytest-asyncio "psycopg[binary]"
       - name: Store contract, durability, leases, two-process race (SQLite) and PostgreSQL parity
-        run: python -m pytest tests/test_control_store.py tests/test_control_store_postgres.py tests/test_orchestrator_techops.py -q -rs
+        # Orchestrator-level lease tests need the knowledge-store dependencies; they run in "Full test suite".
+        run: python -m pytest tests/test_control_store.py tests/test_control_store_postgres.py -q -rs
 
   packaging:
     name: Installed-package catalogs
