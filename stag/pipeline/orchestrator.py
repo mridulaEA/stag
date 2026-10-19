@@ -152,6 +152,19 @@ class PipelineOrchestrator:
                 await self._process_event(event)
             except Exception as e:
                 logger.error("pipeline.event_error", event_id=event.id, error=str(e))
+                await self._settle(self.stream.nack(event, f"{type(e).__name__}: {str(e)[:160]}"))
+                continue
+            # Acknowledge only after the pipeline reached a durable outcome (registration, dedup
+            # verdict or decision). A crash before this point leaves the delivery uncommitted; the
+            # redelivery is then settled by durable dedup, never by a second incident.
+            await self._settle(self.stream.ack(event))
+
+    @staticmethod
+    async def _settle(coro) -> None:
+        try:
+            await coro
+        except Exception as e:  # an acknowledgement failure must not take the loop down
+            logger.error("pipeline.ack_error", error=str(e))
 
     async def _index(self, event: StreamEvent) -> None:
         """Index an accepted observation with a deadline; a stalled store cannot hold the loop."""
@@ -402,6 +415,7 @@ class PipelineOrchestrator:
             "investigations_suppressed": self._suppressed_count,
             "trigger_rate": self._trigger_count / max(1, self._event_count),
             "techops": self.coordinator.stats if self.coordinator else None,
+            "stream": getattr(self.stream, "stats", None),
             "status": self.status,
             "last_error": self.last_error,
             "trigger_engine": self.triggers.stats,

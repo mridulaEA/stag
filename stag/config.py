@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic: str = "stag-events"
     kafka_group_id: str = "stag-consumer"
+    # Offsets are committed only after the pipeline acknowledges a durable outcome (R17).
+    kafka_id_field: str = "id"  # records must carry the source's own stable event id; none is minted
+    kafka_max_record_bytes: int = 1_000_000
+    kafka_dead_letter_max: int = 1000  # bounded in-memory buffer of poison-record coordinates
+    kafka_on_failure: Literal["dead_letter", "halt"] = "dead_letter"  # halt = stop and redeliver after restart
 
     # Storage
     chroma_persist_dir: str = "./data/chroma"

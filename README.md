@@ -313,6 +313,10 @@ All configuration is via environment variables (or `.env` file):
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Kafka broker addresses |
 | `KAFKA_TOPIC` | `stag-events` | Kafka topic to consume |
 | `KAFKA_GROUP_ID` | `stag-consumer` | Kafka consumer group ID |
+| `KAFKA_ID_FIELD` | `id` | Record field holding the source's stable event id; records without it are dead-lettered, never given a fresh id |
+| `KAFKA_MAX_RECORD_BYTES` | `1000000` | Larger records are dead-lettered |
+| `KAFKA_DEAD_LETTER_MAX` | `1000` | Bounded buffer of poison-record coordinates (`GET /api/stream/dead-letters`) |
+| `KAFKA_ON_FAILURE` | `dead_letter` | Processing failure policy: `dead_letter` commits and continues; `halt` stops consuming and lets the group redeliver after restart |
 | **Storage** | | |
 | `CHROMA_PERSIST_DIR` | `./data/chroma` | Vector index persistence directory (NumPy files; name kept for compatibility) |
 | `GRAPH_PERSIST_PATH` | `./data/graph.json` | Knowledge graph persistence file |

@@ -52,6 +52,10 @@ def create_stream_source(settings):
             bootstrap_servers=settings.kafka_bootstrap_servers,
             topic=settings.kafka_topic,
             group_id=settings.kafka_group_id,
+            id_field=settings.kafka_id_field,
+            max_record_bytes=settings.kafka_max_record_bytes,
+            dead_letter_max=settings.kafka_dead_letter_max,
+            on_failure=settings.kafka_on_failure,
         )
     elif settings.stream_source == "webhook":
         return WebhookStreamSource()

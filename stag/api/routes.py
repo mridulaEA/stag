@@ -202,6 +202,18 @@ def _incident_for_operation(record):
         raise HTTPException(409, f"operation {record.operation_id} refers to unknown incident {record.incident_id}") from None
 
 
+@router.get("/stream/dead-letters")
+async def stream_dead_letters():
+    """Records the stream adapter consumed but could not process (coordinates and reason only)."""
+    if _pipeline is None:
+        raise HTTPException(503, "pipeline not ready")
+    stream = _pipeline.stream
+    letters = getattr(stream, "dead_letters", None)
+    if letters is None:
+        raise HTTPException(404, f"{type(stream).__name__} has no dead-letter buffer")
+    return {"dead_letters": letters, "stats": getattr(stream, "stats", {})}
+
+
 @router.get("/techops/incidents")
 async def list_incidents(open_only: bool = False):
     coord = _coordinator()

@@ -22,7 +22,8 @@ These drive the Phase 1+ work; anything not listed here stays as `docs/review/FI
    two-process and crash tests (R14, R16). **Done** in `stag/techops/store.py`; the outbox moves to
    step 3 with the first notification adapter, where it has a consumer.
 2. Kafka ingestion: decode boundary, manual commit after durable registration, dead-letter,
-   lag metrics; in-memory broker fake locally, real broker in CI (R17).
+   lag metrics; in-memory broker fake locally, real broker in CI (R17). **Done** in `stag/streams/kafka_stream.py`
+   (`StreamSource.ack/nack` contract, `apache/kafka` service container in CI).
 3. Connector contracts and first adapters: ticketing action adapter, PagerDuty / Slack / email
    notification adapters, all with fakes and config templates (R05, R23 live path).
 4. Model routes and token budgets: allowlisted routes for both providers, reserve/settle on real

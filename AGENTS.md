@@ -66,7 +66,10 @@ cd frontend && npm install && npm run dev  # dashboard at :5173
 - `stag/crews/` runs declarative crews on the backbone. The schema has no step for direct
   production mutation; `authorize` needs a `human: true` role or a severity-bounded policy (≤ medium).
 - Stream adapters preserve source identity: `StreamEvent.id` is the source's logical event id,
-  never a replay cursor or a fresh UUID for a forwarded event.
+  never a replay cursor or a fresh UUID for a forwarded event. Adapters with delivery semantics
+  commit only in `ack()` (called by the orchestrator after a durable outcome) and never let the
+  commit position pass an in-flight delivery; undecodable records are dead-lettered by
+  coordinates and digest, never logged with their content.
 - Agents never change incident state, authorize, or dispatch. Those happen through explicit API
   calls with an actor and reason.
 - Telemetry, payloads and retrieved documents are untrusted input.
