@@ -37,7 +37,12 @@ fi
 PYTHON="${PYTHON:-python3}"
 command -v "$PYTHON" >/dev/null || { echo "python3 is required" >&2; exit 1; }
 
-PYTHONPATH="$SRC" "$PYTHON" -m stag.skills --skills-dir "$SRC/skills" install --target "$TARGET" --scope "$SCOPE" --force
+MODE_FLAG=""
+if [[ -n "$CLEANUP" ]]; then
+  MODE_FLAG="--mode copy"   # the clone is removed below; links into it would dangle
+fi
+# shellcheck disable=SC2086
+PYTHONPATH="$SRC" "$PYTHON" -m stag.skills --skills-dir "$SRC/skills" install --target "$TARGET" --scope "$SCOPE" --force $MODE_FLAG
 
 if [[ -n "$CLEANUP" ]]; then rm -rf "$CLEANUP"; fi
 

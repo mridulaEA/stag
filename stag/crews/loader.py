@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from stag._resources import REPO_ROOT, MissingCatalog, asset_dir
 from stag.crews.schema import Crew, Scenario
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-CREWS_DIR = REPO_ROOT / "crews"
-SKILLS_DIR = REPO_ROOT / "skills"
-AGENTS_DIR = REPO_ROOT / "agents"
+CREWS_DIR = asset_dir("crews")
+SKILLS_DIR = asset_dir("skills")
+AGENTS_DIR = asset_dir("agents")
+
+__all__ = ["CREWS_DIR", "SKILLS_DIR", "AGENTS_DIR", "REPO_ROOT", "MissingCatalog", "discover_crews",
+           "load_crew", "load_scenario", "validate_crew", "validate_all"]
 
 
 def discover_crews(crews_dir: Path = CREWS_DIR) -> list[Crew]:
@@ -50,8 +53,20 @@ def validate_crew(
     for agent in crew.agents:
         if not (agents_dir / f"{agent}.md").is_file():
             problems.append(f"unknown agent '{agent}'")
+    try:
+        from stag.triggers import RuleRegistry
+
+        if crew.triggers:
+            RuleRegistry.from_specs([t.model_dump() for t in crew.triggers])
+    except Exception as e:  # unknown rule type / bad params must fail validation, not the first run
+        problems.append(f"invalid trigger spec: {e}")
     if crew.path is not None and not (crew.path / "scenario.yaml").is_file():
         problems.append("missing scenario.yaml (needed for end-to-end checks)")
+    elif crew.path is not None:
+        try:
+            Scenario.from_yaml(crew.path / "scenario.yaml")
+        except Exception as e:
+            problems.append(f"invalid scenario.yaml: {e}")
     if crew.path is not None and not (crew.path / "README.md").is_file():
         problems.append("missing README.md")
     return problems

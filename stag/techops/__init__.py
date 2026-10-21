@@ -16,7 +16,15 @@ Continuous monitoring does not require continuous LLM calls: the monitoring path
 evidence; the investigation path runs only when a material change needs interpretation.
 """
 
-from stag.techops.actions import ActionLedger, ActionRecord, ActionState
+from stag.techops.actions import (
+    ActionLedger,
+    ActionRecord,
+    ActionState,
+    IntegrityError,
+    InvalidActionTransition,
+    RetryBudgetExceeded,
+    VerificationResult,
+)
 from stag.techops.assignment import (
     AssignmentLimits,
     AssignmentPermissions,
@@ -33,14 +41,16 @@ from stag.techops.coordinator import (
     IncidentCoordinator,
     InvestigationRequest,
     Observation,
+    RegistrationResult,
 )
-from stag.techops.identity import ObservationIdentity, SignalKey, payload_hash
+from stag.techops.identity import ObservationIdentity, SignalKey, envelope_hash, payload_hash
 from stag.techops.incident import (
     Incident,
     IncidentState,
     InvalidTransition,
     MaterialChange,
     Transition,
+    VerificationRecord,
 )
 
 __all__ = [
@@ -67,6 +77,13 @@ __all__ = [
     "ActionLedger",
     "ActionRecord",
     "ActionState",
+    "InvalidActionTransition",
+    "IntegrityError",
+    "RetryBudgetExceeded",
+    "VerificationResult",
+    "VerificationRecord",
+    "RegistrationResult",
+    "envelope_hash",
     "BudgetExhausted",
     "BudgetLedger",
     "Reservation",

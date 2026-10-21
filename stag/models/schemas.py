@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 from uuid import uuid4
@@ -50,12 +50,30 @@ class StreamEvent(BaseModel):
     """A single event from a data stream."""
 
     id: str = Field(default_factory=lambda: str(uuid4()))
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     source: str
     event_type: EventType
     severity: Severity = Severity.LOW
     payload: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def doc_key(self) -> str:
+        """Canonical source-scoped key for knowledge stores (JSON array, collision-free)."""
+        import json
+
+        return json.dumps([self.source, self.id], separators=(",", ":"), ensure_ascii=False)
+
+    @property
+    def is_replay(self) -> bool:
+        """Historical replay is isolated from live incidents, paging and actions."""
+        return bool(self.metadata.get("replay"))
+
+    @property
+    def event_time(self) -> datetime:
+        """Timezone-aware occurrence time (naive timestamps are treated as UTC)."""
+        ts = self.timestamp
+        return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
 
     @property
     def text(self) -> str:
@@ -117,7 +135,7 @@ class GeneratedInsight(BaseModel):
     """LLM-generated insight from the pipeline."""
 
     id: str = Field(default_factory=lambda: str(uuid4()))
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     trigger_id: str
     event_id: str
     title: str
@@ -127,6 +145,8 @@ class GeneratedInsight(BaseModel):
     recommendations: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    generation_mode: str = "fallback"  # llm | fallback | degraded
+    degraded_reason: str | None = None
 
 
 class PipelineOutput(BaseModel):

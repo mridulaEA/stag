@@ -51,8 +51,13 @@ cd frontend && npm install && npm run dev  # dashboard at :5173
 
 - `stag/techops/` is the deterministic backbone: `identity` → `incident` (state machine) →
   `coordinator` (dedup, correlation, material change) → `assignment` (bounded agent contract) →
-  `actions` (retry-safe ledger) → `budget` (admission control). Keep it pure Python + pydantic,
-  no I/O, fully unit-tested.
+  `actions` (retry-safe ledger) → `budget` (admission control). The *logic* stays pure Python +
+  pydantic and fully unit-tested; the *state* lives behind `store.ControlStore` (in-memory, SQLite,
+  PostgreSQL via `CONTROL_STORE_URL`). Every mutation is load → mutate → compare-and-swap inside
+  `store.transaction()`; races are settled by `insert_unique`, never by checking then writing.
+- Investigation requests are work items: queued → running (leased to one worker id) → succeeded |
+  failed. Claim before model work, complete with the outcome; never generate for a request you do
+  not hold.
 - The orchestrator (`stag/pipeline/orchestrator.py`) calls the coordinator *before* retrieval and
   generation when `TECHOPS_COORDINATOR_ENABLED=true`. Duplicate deliveries and evidence-only
   updates must never reach the LLM.
@@ -61,7 +66,10 @@ cd frontend && npm install && npm run dev  # dashboard at :5173
 - `stag/crews/` runs declarative crews on the backbone. The schema has no step for direct
   production mutation; `authorize` needs a `human: true` role or a severity-bounded policy (≤ medium).
 - Stream adapters preserve source identity: `StreamEvent.id` is the source's logical event id,
-  never a replay cursor or a fresh UUID for a forwarded event.
+  never a replay cursor or a fresh UUID for a forwarded event. Adapters with delivery semantics
+  commit only in `ack()` (called by the orchestrator after a durable outcome) and never let the
+  commit position pass an in-flight delivery; undecodable records are dead-lettered by
+  coordinates and digest, never logged with their content.
 - Agents never change incident state, authorize, or dispatch. Those happen through explicit API
   calls with an actor and reason.
 - Telemetry, payloads and retrieved documents are untrusted input.
@@ -76,6 +84,14 @@ cd frontend && npm install && npm run dev  # dashboard at :5173
   README configuration table.
 - Commit messages: imperative, scoped (`techops: ...`, `skills: ...`, `frontend: ...`).
 - Do not commit `.env`, `data/`, `frontend/dist/`.
+
+## Status and review ledger
+
+STAG is a local development and simulation project: no API authentication, in-memory control
+state, simulated crew runs. `docs/STATUS.md` says what is implemented vs simulated vs planned;
+`docs/review/FINDINGS.md` tracks the engineering-review findings (R01–R32) and their status.
+When you change the ledger, coordinator, runner or installer, add a regression test to
+`tests/test_review_regressions.py` or the module's test file and update the ledger row.
 
 ## Community
 

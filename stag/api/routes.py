@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+import asyncio
+
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from stag.crews import CREWS_DIR, Scenario, discover_crews, load_crew, load_scenario, run_crew
 from stag.models import StreamEvent
-from stag.techops import ActionLedger, IncidentState
+from stag.techops import ActionLedger, IncidentState, VerificationResult
 
 router = APIRouter()
 
@@ -28,7 +30,27 @@ def set_dependencies(pipeline, ws_manager, action_ledger: ActionLedger | None = 
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.3.0"}
+    """Liveness plus component readiness. ``status`` is ``degraded`` when a required part is down."""
+    components = {
+        "pipeline": getattr(_pipeline, "status", "not_initialized") if _pipeline is not None else "not_initialized",
+        "pipeline_error": getattr(_pipeline, "last_error", None) if _pipeline is not None else None,
+        "generator": (
+            "llm" if _pipeline is not None and getattr(getattr(_pipeline, "generator", None), "stats", {}).get("has_client")
+            else "fallback"
+        ),
+        "techops_coordinator": "enabled" if _pipeline is not None and getattr(_pipeline, "coordinator", None) else "disabled",
+        "websocket_clients": _ws_manager.connection_count if _ws_manager is not None else 0,
+    }
+    ready = components["pipeline"] == "ready"
+    return {"status": "ok" if ready else "degraded", "ready": ready, "version": "0.3.0", "mode": "local-demo", "components": components}
+
+
+@router.get("/ready")
+async def ready():
+    """Readiness probe: 503 unless the stream processing task is alive."""
+    if _pipeline is None or not getattr(_pipeline, "healthy", False):
+        raise HTTPException(503, f"pipeline not ready: {getattr(_pipeline, 'last_error', None) or getattr(_pipeline, 'status', 'not_initialized')}")
+    return {"ready": True}
 
 
 @router.get("/stats")
@@ -41,7 +63,7 @@ async def stats():
 # --- Events ---
 
 @router.get("/events")
-async def get_events(limit: int = 50):
+async def get_events(limit: int = Query(50, ge=1, le=500)):
     """Get recent stream events."""
     if not _pipeline:
         raise HTTPException(503, "Pipeline not initialized")
@@ -60,7 +82,7 @@ async def ingest_event(event: StreamEvent):
 # --- Insights ---
 
 @router.get("/insights")
-async def get_insights(limit: int = 20):
+async def get_insights(limit: int = Query(20, ge=1, le=200)):
     """Get recent pipeline outputs (triggered insights)."""
     if not _pipeline:
         raise HTTPException(503, "Pipeline not initialized")
@@ -70,7 +92,7 @@ async def get_insights(limit: int = 20):
 # --- Knowledge ---
 
 @router.get("/knowledge/search")
-async def search_knowledge(q: str, top_k: int = 10):
+async def search_knowledge(q: str = Query(min_length=1, max_length=500), top_k: int = Query(10, ge=1, le=50)):
     """Search the hybrid knowledge base."""
     if not _pipeline:
         raise HTTPException(503, "Pipeline not initialized")
@@ -93,10 +115,8 @@ async def start_pipeline():
     """Start the pipeline (if stopped)."""
     if not _pipeline:
         raise HTTPException(503, "Pipeline not initialized")
-    if _pipeline._running:
-        return {"status": "already_running"}
-    await _pipeline.start()
-    return {"status": "started"}
+    await _pipeline.start()  # idempotent
+    return {"status": "running"}
 
 
 @router.post("/pipeline/stop")
@@ -131,24 +151,67 @@ class ExternalLinkRequest(BaseModel):
 
 
 class PrepareActionRequest(BaseModel):
-    incident_id: str
-    plan_step: str
-    target: str
+    incident_id: str = Field(min_length=1, max_length=64)
+    plan_step: str = Field(min_length=1, max_length=120)
+    target: str = Field(min_length=1, max_length=200)
     parameters: dict = Field(default_factory=dict)
-    policy_version: str = "unversioned"
-    preconditions: list[str] = Field(default_factory=list)
+    policy_version: str = Field(default="unversioned", max_length=120)
+    preconditions: list[str] = Field(default_factory=list, max_length=32)
 
 
 class AuthorizeActionRequest(BaseModel):
-    actor: str
-    incident_version: int
-    note: str = ""
+    actor: str = Field(min_length=1, max_length=200)
+    note: str = Field(default="", max_length=1000)
+    # Optional consistency check only. The approval is always bound to the server's current
+    # incident version; a mismatch is rejected rather than trusted.
+    expected_incident_version: int | None = Field(default=None, ge=1)
+
+
+class VerificationEvidence(BaseModel):
+    """Evidence for a verification claim: where it came from, over what window, which signals."""
+
+    source: str = Field(min_length=1, max_length=200)
+    window: str = Field(min_length=1, max_length=200)
+    signals: list[str] = Field(min_length=1, max_length=64)
+    target: str | None = Field(default=None, max_length=200)
+    simulated: bool = False
+    details: dict = Field(default_factory=dict)
 
 
 class VerifyActionRequest(BaseModel):
-    healthy: bool
-    evidence: dict = Field(default_factory=dict)
-    actor: str = "verifier"
+    """A verification claim. Empty evidence does not validate (422)."""
+
+    healthy: bool | None
+    evidence: VerificationEvidence
+    actor: str = Field(default="verifier", min_length=1, max_length=200)
+
+
+def _operation_or_404(operation_id: str):
+    try:
+        return _action_ledger.get(operation_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown operation {operation_id}") from None
+
+
+def _incident_for_operation(record):
+    """Load the incident behind an operation from server state (never from the request)."""
+    coord = _coordinator()
+    try:
+        return coord.get_incident(record.incident_id)
+    except KeyError:
+        raise HTTPException(409, f"operation {record.operation_id} refers to unknown incident {record.incident_id}") from None
+
+
+@router.get("/stream/dead-letters")
+async def stream_dead_letters():
+    """Records the stream adapter consumed but could not process (coordinates and reason only)."""
+    if _pipeline is None:
+        raise HTTPException(503, "pipeline not ready")
+    stream = _pipeline.stream
+    letters = getattr(stream, "dead_letters", None)
+    if letters is None:
+        raise HTTPException(404, f"{type(stream).__name__} has no dead-letter buffer")
+    return {"dead_letters": letters, "stats": getattr(stream, "stats", {})}
 
 
 @router.get("/techops/incidents")
@@ -195,47 +258,77 @@ async def link_external(incident_id: str, body: ExternalLinkRequest):
 
 
 @router.get("/techops/investigations")
-async def list_investigations():
+async def list_investigations(pending: bool = False):
+    """Investigation requests with their work lifecycle (queued → running → succeeded | failed).
+
+    ``pending=true`` lists only the work still claimable by a worker (queued, or failed and retryable).
+    """
     coord = _coordinator()
-    return {"investigations": [r.model_dump(mode="json") for r in coord.investigation_requests]}
+    requests = coord.pending_investigations() if pending else coord.investigation_requests
+    return {"investigations": [r.model_dump(mode="json") for r in requests]}
+
+
+@router.get("/techops/investigations/{request_id}")
+async def get_investigation(request_id: str):
+    coord = _coordinator()
+    try:
+        request = coord.get_request(request_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown investigation request {request_id}") from None
+    return {"investigation": request.model_dump(mode="json"), "stale": coord.is_request_stale(request_id)}
 
 
 @router.get("/techops/actions")
 async def list_actions():
+    _coordinator()
     return {"actions": [a.model_dump(mode="json") for a in _action_ledger.records], "stats": _action_ledger.stats}
 
 
 @router.post("/techops/actions/prepare")
 async def prepare_action(body: PrepareActionRequest):
-    """Create (or return) the durable operation record. Same plan step → same operation id."""
+    """Create (or return) the durable operation record for an *existing, open* incident."""
+    coord = _coordinator()
+    try:
+        incident = coord.get_incident(body.incident_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown incident {body.incident_id}") from None
+    if not incident.is_open:
+        raise HTTPException(409, f"incident {body.incident_id} is {incident.state.value}; no new actions")
     record = _action_ledger.prepare(**body.model_dump())
-    return record.model_dump(mode="json")
+    return _action_ledger.view(record.operation_id).model_dump(mode="json")
 
 
 @router.post("/techops/actions/{operation_id}/authorize")
 async def authorize_action(operation_id: str, body: AuthorizeActionRequest):
+    """Bind an approval to the operation's exact terms and the incident's *current* version."""
+    record = _operation_or_404(operation_id)
+    incident = _incident_for_operation(record)
+    if not incident.is_open:
+        raise HTTPException(409, f"incident {incident.id} is {incident.state.value}")
+    if body.expected_incident_version is not None and body.expected_incident_version != incident.version:
+        raise HTTPException(
+            409,
+            f"incident {incident.id} is at version {incident.version}, not {body.expected_incident_version}; review the current evidence",
+        )
     try:
-        record = _action_ledger.authorize(operation_id, body.actor, body.incident_version, body.note)
-    except KeyError:
-        raise HTTPException(404, f"unknown operation {operation_id}") from None
+        record = _action_ledger.authorize(operation_id, body.actor, incident.version, body.note)
     except Exception as e:
         raise HTTPException(409, str(e)) from e
     return record.model_dump(mode="json")
 
 
 @router.post("/techops/actions/{operation_id}/dispatch")
-async def dispatch_action(operation_id: str, current_incident_version: int | None = None):
-    """Revalidate the approval against the current incident version, then dispatch."""
+async def dispatch_action(operation_id: str):
+    """Dispatch after the ledger revalidates the approval against the incident's current version.
+
+    There is no caller-supplied version: freshness is decided from server state.
+    """
+    record = _operation_or_404(operation_id)
+    incident = _incident_for_operation(record)
+    if not incident.is_open:
+        raise HTTPException(409, f"incident {incident.id} is {incident.state.value}")
     try:
-        if current_incident_version is not None:
-            record = _action_ledger.revalidate(operation_id, current_incident_version)
-            if record.state.value == "stale":
-                raise HTTPException(409, "approval is stale; re-authorization required")
-        record = _action_ledger.dispatch(operation_id)
-    except KeyError:
-        raise HTTPException(404, f"unknown operation {operation_id}") from None
-    except HTTPException:
-        raise
+        record = _action_ledger.dispatch(operation_id, actor="api", current_incident_version=incident.version)
     except Exception as e:
         raise HTTPException(409, str(e)) from e
     return record.model_dump(mode="json")
@@ -243,10 +336,9 @@ async def dispatch_action(operation_id: str, current_incident_version: int | Non
 
 @router.post("/techops/actions/{operation_id}/outcome-unknown")
 async def action_outcome_unknown(operation_id: str):
+    _operation_or_404(operation_id)
     try:
         record = _action_ledger.mark_outcome_unknown(operation_id)
-    except KeyError:
-        raise HTTPException(404, f"unknown operation {operation_id}") from None
     except Exception as e:
         raise HTTPException(409, str(e)) from e
     return record.model_dump(mode="json")
@@ -254,10 +346,20 @@ async def action_outcome_unknown(operation_id: str):
 
 @router.post("/techops/actions/{operation_id}/reconcile")
 async def reconcile_action(operation_id: str, target_state_observed: bool):
+    _operation_or_404(operation_id)
     try:
         record = _action_ledger.reconcile(operation_id, target_state_observed)
-    except KeyError:
-        raise HTTPException(404, f"unknown operation {operation_id}") from None
+    except Exception as e:
+        raise HTTPException(409, str(e)) from e
+    return record.model_dump(mode="json")
+
+
+@router.post("/techops/actions/{operation_id}/applied")
+async def action_applied(operation_id: str):
+    """The destination confirmed the change was applied. Still requires independent verification."""
+    _operation_or_404(operation_id)
+    try:
+        record = _action_ledger.mark_applied(operation_id)
     except Exception as e:
         raise HTTPException(409, str(e)) from e
     return record.model_dump(mode="json")
@@ -265,13 +367,22 @@ async def reconcile_action(operation_id: str, target_state_observed: bool):
 
 @router.post("/techops/actions/{operation_id}/verify")
 async def verify_action(operation_id: str, body: VerifyActionRequest):
+    """Record independent verification on the operation *and* bind it to the incident.
+
+    Simulated evidence is refused by the live coordinator; a healthy verdict is required (and
+    must be current) before the incident can be transitioned to RESOLVED.
+    """
+    record = _operation_or_404(operation_id)
+    incident = _incident_for_operation(record)
+    if body.evidence.simulated:
+        raise HTTPException(409, "simulated verification evidence is not accepted by the live coordinator")
     try:
-        record = _action_ledger.verify(operation_id, body.healthy, body.evidence, body.actor)
-    except KeyError:
-        raise HTTPException(404, f"unknown operation {operation_id}") from None
-    except Exception as e:
+        result = VerificationResult(healthy=body.healthy, **body.evidence.model_dump())
+        _action_ledger.verify(operation_id, body.healthy, result, body.actor)
+        _coordinator().record_verification(incident.id, result, operation_id=operation_id, verified_by=body.actor)
+    except (ValueError, Exception) as e:
         raise HTTPException(409, str(e)) from e
-    return record.model_dump(mode="json")
+    return _action_ledger.view(operation_id).model_dump(mode="json")
 
 
 # --- Crews ---
@@ -339,19 +450,29 @@ async def get_crew(name: str):
 
 @router.post("/crews/{name}/run")
 async def run_crew_endpoint(name: str, body: CrewRunRequest | None = None):
-    """Run a crew end-to-end against a scenario (bundled by default) using the deterministic executor.
+    """SIMULATION: run a crew against a scenario (bundled by default) with the deterministic executor.
 
-    This is a dry run on an isolated coordinator/ledger: it never touches the live pipeline state.
-    Without ``auto_approve`` the run halts at the human gate, which is the expected production shape.
+    The run uses an isolated coordinator and ledger; it never touches live pipeline state, never
+    calls a model or a remediation destination, and its approvals are simulated flags. Without
+    ``auto_approve`` the run halts at the human gate.
     """
     crew = _crew_or_404(name)
     body = body or CrewRunRequest()
     scenario = body.scenario or load_scenario(crew)
-    report = run_crew(crew, scenario, auto_approve=body.auto_approve)
+    try:
+        report = await asyncio.to_thread(run_crew, crew, scenario, body.auto_approve)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
     data = report.model_dump(mode="json")
     data.update(
-        {"model_calls_avoided": report.model_calls_avoided, "resolved": report.resolved, "held": report.held,
-         "markdown": report.to_markdown()}
+        {
+            "mode": "simulation",
+            "model_calls_avoided": report.model_calls_avoided,
+            "resolved": report.resolved,
+            "held": report.held,
+            "failed_steps": report.failed_steps,
+            "markdown": report.to_markdown(),
+        }
     )
     return data
 

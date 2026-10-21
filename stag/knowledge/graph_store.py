@@ -97,7 +97,7 @@ class GraphStore:
 
         # Event node
         self._ensure_node(
-            f"event:{event.id}",
+            f"event:{event.doc_key}",
             "event",
             label=event.event_type.value,
             severity=event.severity.value,
@@ -116,7 +116,7 @@ class GraphStore:
         if department and tool:
             self._ensure_edge(f"dept:{department}", f"tool:{tool}", "uses_tool")
         if user:
-            self._ensure_edge(f"user:{user}", f"event:{event.id}", "triggered")
+            self._ensure_edge(f"user:{user}", f"event:{event.doc_key}", "triggered")
 
         # Periodic persistence
         if self._event_count % 20 == 0:

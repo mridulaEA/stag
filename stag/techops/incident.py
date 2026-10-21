@@ -1,6 +1,6 @@
 """Incident lifecycle as a versioned state machine.
 
-    DETECTED → CORRELATED → TRIAGED → INVESTIGATING
+    DETECTED → CORRELATED → TRIAGED → INVESTIGATING ──► HELD (partial findings / awaiting human)
                                           ↓
                                   ACTION_PROPOSED
                                           ↓
@@ -12,6 +12,8 @@
                                           ↓
                               RESOLVED / INVESTIGATING (again)
 
+RESOLVED is reachable only from VERIFYING: closing an incident requires a verification step.
+A candidate that turns out not to be an incident is DISMISSED (administrative closure, with reason).
 Transitions are implemented and versioned here. An agent saying "resolved" does not move an
 incident to RESOLVED; only an explicit, recorded transition does.
 """
@@ -53,11 +55,12 @@ TERMINAL_STATES = {IncidentState.RESOLVED, IncidentState.DISMISSED}
 TRANSITIONS: dict[IncidentState, set[IncidentState]] = {
     IncidentState.DETECTED: {IncidentState.CORRELATED, IncidentState.TRIAGED, IncidentState.DISMISSED},
     IncidentState.CORRELATED: {IncidentState.TRIAGED, IncidentState.DISMISSED},
-    IncidentState.TRIAGED: {IncidentState.INVESTIGATING, IncidentState.DISMISSED, IncidentState.RESOLVED},
+    IncidentState.TRIAGED: {IncidentState.INVESTIGATING, IncidentState.DISMISSED},
     IncidentState.INVESTIGATING: {
         IncidentState.ACTION_PROPOSED,
         IncidentState.TRIAGED,
         IncidentState.VERIFYING,
+        IncidentState.HELD,
         IncidentState.DISMISSED,
     },
     IncidentState.ACTION_PROPOSED: {IncidentState.AUTHORIZED, IncidentState.HELD, IncidentState.REJECTED},
@@ -88,6 +91,20 @@ class InvalidTransition(Exception):
     """Raised when a lifecycle transition is not permitted."""
 
 
+class VerificationRecord(BaseModel):
+    """The verification result that may authorize RESOLVED. Bound to the evidence version it saw."""
+
+    healthy: bool
+    at_version: int
+    operation_id: str | None = None
+    source: str
+    window: str
+    signals: list[str]
+    simulated: bool = False
+    verified_by: str = "verifier"
+    at: datetime = Field(default_factory=_now)
+
+
 class Transition(BaseModel):
     from_state: IncidentState
     to_state: IncidentState
@@ -111,11 +128,13 @@ class Incident(BaseModel):
     observation_count: int = 0
     duplicate_delivery_count: int = 0
     conflicting_delivery_count: int = 0
+    late_evidence_count: int = 0
     example_observation_ids: list[str] = Field(default_factory=list)
     signatures: list[str] = Field(default_factory=list)
     external_refs: dict[str, str] = Field(default_factory=dict)
     last_investigation_version: int | None = None
     last_investigation_at: datetime | None = None
+    last_verification: VerificationRecord | None = None
     history: list[Transition] = Field(default_factory=list)
     attributes: dict[str, Any] = Field(default_factory=dict)
 
@@ -128,10 +147,38 @@ class Incident(BaseModel):
     def can_transition(self, to: IncidentState) -> bool:
         return to in TRANSITIONS[self.state]
 
+    @property
+    def resolution_blocker(self) -> str | None:
+        """Why RESOLVED is not permitted right now (None when a current, successful verification exists)."""
+        v = self.last_verification
+        if v is None:
+            return "no verification result recorded"
+        if not v.healthy:
+            return "last verification did not confirm recovery"
+        if v.at_version != self.version:
+            return f"verification is stale (seen v{v.at_version}, incident now v{self.version})"
+        return None
+
+    def record_verification(self, record: VerificationRecord) -> None:
+        """Attach an independent verification result bound to the current evidence version."""
+        if record.at_version != self.version:
+            raise InvalidTransition(
+                f"{self.id}: verification was taken at v{record.at_version} but the incident is at v{self.version}"
+            )
+        self.last_verification = record
+
     def transition(self, to: IncidentState, actor: str, reason: str) -> Transition:
-        """Apply a lifecycle transition. Raises InvalidTransition when the edge is not allowed."""
+        """Apply a lifecycle transition. Raises InvalidTransition when the edge is not allowed.
+
+        RESOLVED additionally requires a successful verification at the *current* evidence version;
+        a generic transition cannot manufacture that authority.
+        """
         if not self.can_transition(to):
             raise InvalidTransition(f"{self.id}: {self.state.value} → {to.value} is not permitted")
+        if to is IncidentState.RESOLVED:
+            blocker = self.resolution_blocker
+            if blocker:
+                raise InvalidTransition(f"{self.id}: cannot resolve — {blocker}")
         self.version += 1
         record = Transition(
             from_state=self.state, to_state=to, actor=actor, reason=reason, version=self.version
@@ -154,10 +201,20 @@ class Incident(BaseModel):
         """A redelivery of an already-accepted observation. Counted separately; no state change."""
         self.duplicate_delivery_count += 1
 
+    def record_late_evidence(self, observation_id: str) -> None:
+        """Evidence that occurred before this episode was resolved: timeline correction, not recurrence."""
+        self.late_evidence_count += 1
+        self.attributes.setdefault("late_evidence_ids", []).append(observation_id)
+
     def record_conflicting_delivery(self) -> None:
         """Same identity, different payload. Quarantined and counted; never silently overwritten."""
         self.conflicting_delivery_count += 1
 
     def mark_investigated(self) -> None:
+        """Record that an investigation was *requested* at this evidence version.
+
+        Request creation is not completion; the work lifecycle (queued/running/succeeded/failed)
+        belongs to the investigation store (see docs/review/FINDINGS.md R16).
+        """
         self.last_investigation_version = self.version
         self.last_investigation_at = _now()

@@ -25,6 +25,7 @@ from stag.streams.kafka_stream import KafkaStreamSource
 from stag.streams.simulator import EventSimulator
 from stag.streams.webhook import WebhookStreamSource
 from stag.techops import ActionLedger, IncidentCoordinator
+from stag.techops.store import control_store_from_url
 from stag.triggers import TriggerEngine
 
 structlog.configure(
@@ -51,6 +52,10 @@ def create_stream_source(settings):
             bootstrap_servers=settings.kafka_bootstrap_servers,
             topic=settings.kafka_topic,
             group_id=settings.kafka_group_id,
+            id_field=settings.kafka_id_field,
+            max_record_bytes=settings.kafka_max_record_bytes,
+            dead_letter_max=settings.kafka_dead_letter_max,
+            on_failure=settings.kafka_on_failure,
         )
     elif settings.stream_source == "webhook":
         return WebhookStreamSource()
@@ -78,6 +83,11 @@ async def lifespan(app: FastAPI):
     retriever = HybridRetriever(vector_store, graph_store, sparse_store)
     generator = InsightGenerator(settings)
 
+    # One control store is shared by the coordinator and the action ledger so that an incident and
+    # the operations against it commit to the same database (and survive a restart together).
+    store = control_store_from_url(settings.control_store_url)
+    logger.info("techops.control_store", store=type(store).__name__, url=settings.control_store_url or "memory://")
+
     coordinator = None
     if settings.techops_coordinator_enabled:
         coordinator = IncidentCoordinator(
@@ -85,8 +95,11 @@ async def lifespan(app: FastAPI):
             investigation_cooldown_seconds=settings.techops_investigation_cooldown_seconds,
             recurrence_window_seconds=settings.techops_recurrence_window_seconds,
             dedup_retention=settings.techops_dedup_retention,
+            processing_mode=settings.techops_processing_mode,
+            store=store,
         )
-        logger.info("techops.coordinator_enabled", tenant=settings.techops_tenant)
+        pending = coordinator.pending_investigations()
+        logger.info("techops.coordinator_enabled", tenant=settings.techops_tenant, pending_investigations=len(pending))
 
     pipeline = PipelineOrchestrator(
         stream_source=stream,
@@ -101,7 +114,7 @@ async def lifespan(app: FastAPI):
     pipeline.on_output(ws_manager.broadcast)
 
     # Wire up API routes
-    set_dependencies(pipeline, ws_manager, action_ledger=ActionLedger())
+    set_dependencies(pipeline, ws_manager, action_ledger=ActionLedger(store=store))
 
     # Initialize and start
     await pipeline.initialize()
@@ -113,6 +126,9 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("stag.shutting_down")
     await pipeline.stop()
+    close = getattr(store, "close", None)
+    if close is not None:
+        close()
 
 
 def create_app() -> FastAPI:

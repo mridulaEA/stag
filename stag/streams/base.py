@@ -52,6 +52,21 @@ class StreamSource(ABC):
             except TimeoutError:
                 continue
 
+    # ------------------------------------------------------------------ acknowledgement contract
+    async def ack(self, event: StreamEvent) -> None:
+        """The pipeline reached a durable outcome for ``event`` (registered, deduplicated or
+        decided). Sources with delivery semantics (Kafka) commit here; others ignore it."""
+        return None
+
+    async def nack(self, event: StreamEvent, reason: str) -> None:
+        """Processing failed before a durable outcome. The source decides what happens to the
+        delivery (dead-letter and move on, or halt and redeliver after restart)."""
+        return None
+
+    @property
+    def stats(self) -> dict:
+        return {"running": self._running, "queued": self._queue.qsize()}
+
     @property
     def is_running(self) -> bool:
         return self._running

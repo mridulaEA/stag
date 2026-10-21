@@ -43,6 +43,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.1",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",
@@ -59,7 +62,7 @@ stag-crews = "stag.crews.cli:main"
 include = ["stag*"]
 
 [tool.setuptools.package-data]
-stag = ["py.typed"]
+stag = ["py.typed", "_assets/**/*"]
 
 [tool.ruff]
 target-version = "py311"

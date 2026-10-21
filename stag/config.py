@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic: str = "stag-events"
     kafka_group_id: str = "stag-consumer"
+    # Offsets are committed only after the pipeline acknowledges a durable outcome (R17).
+    kafka_id_field: str = "id"  # records must carry the source's own stable event id; none is minted
+    kafka_max_record_bytes: int = 1_000_000
+    kafka_dead_letter_max: int = 1000  # bounded in-memory buffer of poison-record coordinates
+    kafka_on_failure: Literal["dead_letter", "halt"] = "dead_letter"  # halt = stop and redeliver after restart
 
     # Storage
     chroma_persist_dir: str = "./data/chroma"
@@ -39,8 +44,8 @@ class Settings(BaseSettings):
     generation_max_tokens: int = 1024
     generation_temperature: float = 0.3
 
-    # Server
-    host: str = "0.0.0.0"
+    # Server (local demo: no authentication → loopback by default; set HOST=0.0.0.0 deliberately)
+    host: str = "127.0.0.1"
     port: int = 8000
     cors_origins: str = '["http://localhost:5173","http://localhost:3000"]'
 
@@ -50,6 +55,15 @@ class Settings(BaseSettings):
     techops_investigation_cooldown_seconds: int = 300
     techops_recurrence_window_seconds: int = 3600
     techops_dedup_retention: int = 50000
+    techops_processing_mode: Literal["live", "replay"] = "live"
+    index_timeout_seconds: float = 5.0
+    # Durable control state (observations, incidents, investigation requests, action ledger).
+    # "" or "memory://" → process-local (lost on restart); "sqlite:///./data/control.sqlite" → single
+    # host, survives restarts; "postgresql://user:pass@host/db" → multi-worker (needs psycopg).
+    control_store_url: str = ""
+    # Identifies this worker when leasing investigation requests; defaults to "<hostname>:<pid>".
+    techops_worker_id: str = ""
+    techops_investigation_lease_seconds: int = 300
 
     # Simulator
     simulator_interval: float = 3.0
