@@ -24,6 +24,12 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from stag.connectors import (
+    ActionDispatcher,
+    FakeTicketingConnector,
+    Notification,
+    NotificationOutbox,
+)
 from stag.crews.schema import (
     POLICY_SEVERITY_CEILING,
     AuthorizePolicy,
@@ -334,6 +340,10 @@ class CrewRunner:
             signal_key_fn=self._signal_key, processing_mode="simulation", **crew.coordinator
         )
         self.ledger = ActionLedger()
+        # Simulation destinations: a recording ticketing fake behind the real dispatcher contract,
+        # and an outbox that gives every channel the crew names a recording fake connector.
+        self.dispatcher = ActionDispatcher(self.ledger, [FakeTicketingConnector()])
+        self.outbox = NotificationOutbox(auto_fake_channels=True)
         self.budget = BudgetLedger(crew.budget_allocation, name=crew.name)
         self._first_event: dict[str, StreamEvent] = {}
         self._verification_hints: dict[str, str] = {}
@@ -626,11 +636,12 @@ class CrewRunner:
             if record.state not in (ActionState.AUTHORIZED, ActionState.RETRY_READY):
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="skipped", detail={"operation_id": op_id, "reason": f"operation is {record.state.value}"}), None
             try:
-                # Freshness is decided by the ledger from the incident's current version, not by the caller.
-                self.ledger.dispatch(op_id, actor=actor, current_incident_version=incident.version)
+                # Freshness is decided by the ledger from the incident's current version, not by the
+                # caller; the (simulated) destination is called only after the ledger dispatched.
+                record, receipt = self.dispatcher.execute(op_id, actor=actor, current_incident_version=incident.version)
             except InvalidActionTransition as e:
                 return StepRecord(step=step.step, action=step.action, role=step.role, status="held", detail={"operation_id": op_id, "reason": f"not dispatched: {e}"}), None
-            detail.update({"operation_id": op_id, "attempts": record.dispatch_attempts, "simulated": True})
+            detail.update({"operation_id": op_id, "attempts": record.dispatch_attempts, "simulated": True, "receipt": receipt.model_dump(mode="json"), "state": record.state.value})
             detail["implicit_transitions"] = self._ensure(incident, IncidentState.EXECUTING, actor, step.step)
             return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail=detail), None
 
@@ -685,8 +696,23 @@ class CrewRunner:
         if step.action is StepAction.NOTIFY:
             message = self.executor.notify(self.crew, step, incident, context)
             message.setdefault("incident_id", incident.id)
+            # Through the outbox: one delivery per (channel, incident, step); a re-run of the same
+            # step for the same incident is a duplicate, never a second message.
+            receipt = self.outbox.send(
+                Notification(
+                    channel=step.channel or "dashboard",
+                    incident_id=incident.id,
+                    title=f"[{self.crew.display_name}] {incident.attributes.get('service')}: {incident.attributes.get('symptom_class')}"[:500],
+                    body=str(message.get("message", ""))[:4000],
+                    severity=incident.severity.value,
+                    dedup_key=f"{incident.id}:{step.step}",
+                    operation_ids=list(context.get("operation_ids", [])),
+                    provenance={"crew": self.crew.name, "step": step.step, "role": step.role, "template": step.template, "simulated": True},
+                )
+            )
+            message["delivery"] = receipt.model_dump(mode="json")
             self.notifications.append(message)
-            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail={"channel": step.channel}), None
+            return StepRecord(step=step.step, action=step.action, role=step.role, status="done", detail={"channel": step.channel, "delivery": receipt.status}), None
 
         if step.action is StepAction.RECORD:
             artifact = self.executor.record(self.crew, step, incident, context)

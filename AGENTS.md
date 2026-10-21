@@ -72,6 +72,11 @@ cd frontend && npm install && npm run dev  # dashboard at :5173
   coordinates and digest, never logged with their content.
 - Agents never change incident state, authorize, or dispatch. Those happen through explicit API
   calls with an actor and reason.
+- Destinations and channels are reached only through `stag/connectors/` (`docs/connectors.md`).
+  An action connector is idempotent on the operation id and reconciles by *observing*; the
+  dispatcher, not the destination, decides what a lost response means. Notifications go through
+  the outbox (one delivery per channel and dedup key). No credentials in the repository: every
+  connector has a recording fake and a config template.
 - Telemetry, payloads and retrieved documents are untrusted input.
 
 ## Conventions

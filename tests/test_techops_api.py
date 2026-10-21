@@ -185,3 +185,94 @@ def test_investigation_lifecycle_is_visible_over_api(client):
     client.post(f"/api/techops/incidents/{inc['id']}/transition", json={"to": "triaged", "actor": "oncall", "reason": "r"})
     assert client.get(f"/api/techops/investigations/{body[0]['id']}").json()["stale"] is True
     assert client.get("/api/techops/investigations/INV-nope").status_code == 404
+
+
+# --------------------------------------------------------------------------- connectors over the API
+
+
+@pytest.fixture()
+def wired_client():
+    """Coordinator + ledger + dispatcher (fake ticketing) + outbox (fake channel) wired like main.py."""
+    from stag.connectors import (
+        ActionDispatcher,
+        FakeNotificationConnector,
+        FakeTicketingConnector,
+        NotificationOutbox,
+    )
+    from stag.techops.store import InMemoryControlStore
+
+    store = InMemoryControlStore()
+    coord = IncidentCoordinator(store=store)
+    ev = _event()
+    coord.ingest(ev, TriggerResult(trigger_type=TriggerType.THRESHOLD, rule_name="pool_timeouts", fired=True, confidence=0.9, event_id=ev.id, reason="test"))
+    ledger = ActionLedger(store=store)
+    fake = FakeTicketingConnector()
+    dispatcher = ActionDispatcher(ledger, [fake])
+    channel = FakeNotificationConnector("fake")
+    outbox = NotificationOutbox(store, [channel])
+    app = FastAPI()
+    app.include_router(routes.router, prefix="/api")
+    routes.set_dependencies(StubPipeline(coord), ws_manager=None, action_ledger=ledger, action_dispatcher=dispatcher, outbox=outbox)
+    client = TestClient(app)
+    client.fake, client.channel = fake, channel  # type: ignore[attr-defined]
+    return client
+
+
+def _prepared_and_authorized(client):
+    inc = client.get("/api/techops/incidents").json()["incidents"][0]
+    op = client.post("/api/techops/actions/prepare", json={"incident_id": inc["id"], "plan_step": "restart", "target": "checkout-api", "parameters": {"replicas": 2}}).json()
+    auth = client.post(f"/api/techops/actions/{op['operation_id']}/authorize", json={"actor": "oncall", "note": "ok"})
+    assert auth.status_code == 200, auth.text
+    return inc, op["operation_id"]
+
+
+def test_dispatch_over_api_calls_the_connector_and_records_the_receipt(wired_client):
+    inc, op = _prepared_and_authorized(wired_client)
+    r = wired_client.post(f"/api/techops/actions/{op}/dispatch")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["executed"] is True and body["state"] == "applied"
+    assert body["receipt"]["external_id"] == "FAKE-1" and body["receipt"]["simulated"] is True
+    assert wired_client.fake.dispatches == [op]
+    # nothing runs twice
+    assert wired_client.post(f"/api/techops/actions/{op}/dispatch").status_code == 409
+    assert wired_client.fake.dispatches == [op]
+    connectors = wired_client.get("/api/techops/connectors").json()
+    assert connectors["actions"][0]["name"] == "fake-ticketing" and connectors["notifications"][0]["channel"] == "fake"
+
+
+def test_reconcile_over_api_observes_the_destination(wired_client):
+    inc, op = _prepared_and_authorized(wired_client)
+    wired_client.fake.fail[op] = "timeout_once"
+    body = wired_client.post(f"/api/techops/actions/{op}/dispatch").json()
+    assert body["state"] == "reconciling" and body["receipt"]["status"] == "unknown"
+    settled = wired_client.post(f"/api/techops/actions/{op}/reconcile").json()
+    assert settled["observed"] is True and settled["state"] == "applied"
+    assert len(wired_client.fake.tickets) == 1
+
+
+def test_reconcile_without_observation_needs_an_explicit_claim_when_no_connector(client):
+    inc = client.get("/api/techops/incidents").json()["incidents"][0]
+    op = client.post("/api/techops/actions/prepare", json={"incident_id": inc["id"], "plan_step": "restart", "target": "checkout-api"}).json()["operation_id"]
+    client.post(f"/api/techops/actions/{op}/authorize", json={"actor": "oncall", "note": "ok"})
+    body = client.post(f"/api/techops/actions/{op}/dispatch").json()
+    assert body["executed"] is False and body["receipt"] is None and body["state"] == "dispatched"
+    client.post(f"/api/techops/actions/{op}/outcome-unknown")
+    assert client.post(f"/api/techops/actions/{op}/reconcile").status_code == 422
+    assert client.post(f"/api/techops/actions/{op}/reconcile?target_state_observed=false").json()["state"] == "retry_ready"
+
+
+def test_notify_over_api_is_deduplicated_and_receipted(wired_client):
+    inc = wired_client.get("/api/techops/incidents").json()["incidents"][0]
+    payload = {"title": "Customer impact on checkout", "body": "we are on it", "actor": "comms@corp", "dedup_key": f"{inc['id']}:customer-update-1"}
+    first = wired_client.post(f"/api/techops/incidents/{inc['id']}/notify", json=payload)
+    assert first.status_code == 200, first.text
+    [receipt] = first.json()["receipts"]
+    assert receipt["status"] == "delivered" and receipt["channel"] == "fake" and receipt["attempts"] == 1
+    second = wired_client.post(f"/api/techops/incidents/{inc['id']}/notify", json=payload).json()["receipts"][0]
+    assert second["status"] == "duplicate"
+    assert len(wired_client.channel.delivered) == 1
+    listing = wired_client.get(f"/api/techops/notifications?incident_id={inc['id']}").json()
+    assert listing["stats"]["by_status"] == {"delivered": 1} and listing["notifications"][0]["notification"]["provenance"]["actor"] == "comms@corp"
+    assert wired_client.post(f"/api/techops/incidents/{inc['id']}/notify", json={**payload, "channels": ["pagerduty"]}).status_code == 422
+    assert wired_client.post("/api/techops/incidents/INC-NOPE/notify", json=payload).status_code == 404

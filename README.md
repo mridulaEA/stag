@@ -337,6 +337,11 @@ All configuration is via environment variables (or `.env` file):
 | `CONTROL_STORE_URL` | *(empty)* | Durable control state for observations, incidents, investigation requests and the action ledger. Empty or `memory://` is process-local; `sqlite:///./data/control.sqlite` survives restarts on one host; `postgresql://…` serves several workers (install `stag[postgres]`) |
 | `TECHOPS_WORKER_ID` | `<hostname>:<pid>` | Identity used when leasing investigation requests to this worker |
 | `TECHOPS_INVESTIGATION_LEASE_SECONDS` | `300` | Lease length for one investigation; an expired lease (crashed worker) becomes claimable again |
+| **Connectors** (`docs/connectors.md`) | | |
+| `ACTION_CONNECTORS` | `fake-ticketing` | Destinations for operations: `fake-ticketing`, `jira`, `servicenow`; a destination without credentials is not built |
+| `NOTIFY_CHANNELS` | `dashboard` | Channels for people: `dashboard`, `pagerduty`, `slack`, `email`, `fake`; deliveries go through a durable, deduplicated outbox |
+| `PAGE_ON_SEVERITY` | `critical` | Page every channel on a new incident / severity increase at or above this, before any model work |
+| `JIRA_*`, `SERVICENOW_*`, `PAGERDUTY_ROUTING_KEY`, `SLACK_WEBHOOK_URL`, `SMTP_*`, `EMAIL_*` | *(empty)* | Destination credentials, host-provided only |
 | **Simulator** | | |
 | `SIMULATOR_INTERVAL` | `3.0` | Seconds between simulated events |
 | `SIMULATOR_SCENARIO` | `enterprise_ai` | Simulation scenario |

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
@@ -17,13 +18,30 @@ router = APIRouter()
 _pipeline = None
 _ws_manager = None
 _action_ledger: ActionLedger | None = None
+_action_dispatcher = None
+_outbox = None
+_dashboard = None
 
 
-def set_dependencies(pipeline, ws_manager, action_ledger: ActionLedger | None = None):
-    global _pipeline, _ws_manager, _action_ledger
+def set_dependencies(pipeline, ws_manager, action_ledger: ActionLedger | None = None, action_dispatcher=None, outbox=None, dashboard=None):
+    global _pipeline, _ws_manager, _action_ledger, _action_dispatcher, _outbox, _dashboard
     _pipeline = pipeline
     _ws_manager = ws_manager
     _action_ledger = action_ledger or ActionLedger()
+    _action_dispatcher = action_dispatcher
+    _outbox = outbox
+    _dashboard = dashboard
+
+
+async def _deliver_pending() -> list:
+    """Drain the outbox now (API callers get receipts) and push dashboard messages to clients."""
+    if _outbox is None:
+        return []
+    receipts = await asyncio.to_thread(_outbox.drain)
+    if _dashboard is not None and _ws_manager is not None:
+        for message in _dashboard.pop_pending():
+            await _ws_manager.broadcast({"type": "notification", "notification": message})
+    return receipts
 
 
 # --- Health & Stats ---
@@ -321,17 +339,24 @@ async def authorize_action(operation_id: str, body: AuthorizeActionRequest):
 async def dispatch_action(operation_id: str):
     """Dispatch after the ledger revalidates the approval against the incident's current version.
 
-    There is no caller-supplied version: freshness is decided from server state.
+    There is no caller-supplied version: freshness is decided from server state. With a connector
+    configured for the operation's target, the destination is called and its receipt recorded
+    (applied / unknown → reconciling / rejected → failed). Without one, the operation is dispatched
+    in the ledger only and the response says so (``executed: false``).
     """
     record = _operation_or_404(operation_id)
     incident = _incident_for_operation(record)
     if not incident.is_open:
         raise HTTPException(409, f"incident {incident.id} is {incident.state.value}")
+    connector = _action_dispatcher.connector_for(record) if _action_dispatcher is not None else None
     try:
+        if connector is not None:
+            record, receipt = await asyncio.to_thread(_action_dispatcher.execute, operation_id, "api", incident.version)
+            return {**record.model_dump(mode="json"), "executed": True, "receipt": receipt.model_dump(mode="json")}
         record = _action_ledger.dispatch(operation_id, actor="api", current_incident_version=incident.version)
     except Exception as e:
         raise HTTPException(409, str(e)) from e
-    return record.model_dump(mode="json")
+    return {**record.model_dump(mode="json"), "executed": False, "receipt": None}
 
 
 @router.post("/techops/actions/{operation_id}/outcome-unknown")
@@ -345,13 +370,76 @@ async def action_outcome_unknown(operation_id: str):
 
 
 @router.post("/techops/actions/{operation_id}/reconcile")
-async def reconcile_action(operation_id: str, target_state_observed: bool):
-    _operation_or_404(operation_id)
+async def reconcile_action(operation_id: str, target_state_observed: bool | None = None):
+    """Settle an uncertain outcome. Without ``target_state_observed`` the operation's connector
+    observes the destination itself; an observation it cannot make leaves the operation reconciling."""
+    record = _operation_or_404(operation_id)
     try:
+        if target_state_observed is None:
+            if _action_dispatcher is None or _action_dispatcher.connector_for(record) is None:
+                raise HTTPException(422, "target_state_observed is required: no connector can observe this operation's target")
+            record, observed = await asyncio.to_thread(_action_dispatcher.reconcile, operation_id, "api")
+            return {**record.model_dump(mode="json"), "observed": observed}
         record = _action_ledger.reconcile(operation_id, target_state_observed)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(409, str(e)) from e
-    return record.model_dump(mode="json")
+    return {**record.model_dump(mode="json"), "observed": target_state_observed}
+
+
+@router.get("/techops/connectors")
+async def list_connectors():
+    return {
+        "actions": _action_dispatcher.describe() if _action_dispatcher is not None else [],
+        "notifications": _outbox.describe() if _outbox is not None else [],
+        "outbox": _outbox.stats if _outbox is not None else None,
+    }
+
+
+class NotifyRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    body: str = Field(default="", max_length=20000)
+    channels: list[str] | None = None  # default: every configured channel
+    severity: Literal["low", "medium", "high", "critical"] | None = None
+    dedup_key: str | None = Field(default=None, max_length=300)
+    actor: str = Field(min_length=1, max_length=200)
+    operation_ids: list[str] = Field(default_factory=list, max_length=50)
+
+
+@router.post("/techops/incidents/{incident_id}/notify")
+async def notify_incident(incident_id: str, body: NotifyRequest):
+    """Send a provenance-tagged notification about an incident through the outbox: one delivery per
+    (channel, dedup key), receipts returned. A repeated call with the same dedup key is a duplicate."""
+    coord = _coordinator()
+    if _outbox is None:
+        raise HTTPException(503, "notification outbox not configured")
+    try:
+        incident = coord.get_incident(incident_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown incident {incident_id}") from None
+    from stag.connectors.notifications import Notification
+
+    channels = body.channels or _outbox.channels
+    unknown = [c for c in channels if _outbox.connector_for(c) is None]
+    if unknown:
+        raise HTTPException(422, f"no connector for channel(s) {unknown}; configured: {_outbox.channels}")
+    dedup = body.dedup_key or f"{incident.id}:{body.actor}:{body.title}"
+    queued = [
+        _outbox.enqueue(Notification(channel=c, incident_id=incident.id, title=body.title, body=body.body, severity=body.severity or incident.severity.value,
+                                     dedup_key=dedup, operation_ids=body.operation_ids, provenance={"actor": body.actor, "incident_version": incident.version}))
+        for c in channels
+    ]
+    delivered = {r.notification_id: r for r in await _deliver_pending()}
+    receipts = [delivered.get(q.notification_id, q) for q in queued]
+    return {"receipts": [r.model_dump(mode="json") for r in receipts]}
+
+
+@router.get("/techops/notifications")
+async def list_notifications(incident_id: str | None = None, limit: int = Query(100, ge=1, le=1000)):
+    if _outbox is None:
+        raise HTTPException(503, "notification outbox not configured")
+    return {"notifications": _outbox.receipts(incident_id, limit=limit), "stats": _outbox.stats}
 
 
 @router.post("/techops/actions/{operation_id}/applied")
