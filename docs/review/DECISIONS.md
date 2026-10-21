@@ -25,7 +25,9 @@ These drive the Phase 1+ work; anything not listed here stays as `docs/review/FI
    lag metrics; in-memory broker fake locally, real broker in CI (R17). **Done** in `stag/streams/kafka_stream.py`
    (`StreamSource.ack/nack` contract, `apache/kafka` service container in CI).
 3. Connector contracts and first adapters: ticketing action adapter, PagerDuty / Slack / email
-   notification adapters, all with fakes and config templates (R05, R23 live path).
+   notification adapters, all with fakes and config templates (R05, R23 live path). **Done** in
+   `stag/connectors/` (`docs/connectors.md`): contracts, dispatcher, outbox, Jira / ServiceNow,
+   dashboard / PagerDuty / Slack / email, recording fakes, `.env.example` templates.
 4. Model routes and token budgets: allowlisted routes for both providers, reserve/settle on real
    token usage, per-investigation and per-day caps (R10, R18 route part).
 5. Remaining connectors: monitoring webhooks, OpenTelemetry, Kubernetes actions.

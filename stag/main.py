@@ -6,6 +6,7 @@ and starts the stream processing loop.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,6 +19,13 @@ from fastapi.staticfiles import StaticFiles
 from stag.api.routes import router, set_dependencies
 from stag.api.websocket import ConnectionManager
 from stag.config import get_settings
+from stag.connectors import (
+    ActionDispatcher,
+    DashboardConnector,
+    NotificationOutbox,
+    build_action_connectors,
+    build_notification_connectors,
+)
 from stag.generation import InsightGenerator
 from stag.knowledge import GraphStore, HybridRetriever, SparseStore, VectorStore
 from stag.pipeline import PipelineOrchestrator
@@ -101,6 +109,14 @@ async def lifespan(app: FastAPI):
         pending = coordinator.pending_investigations()
         logger.info("techops.coordinator_enabled", tenant=settings.techops_tenant, pending_investigations=len(pending))
 
+    # Connectors: destinations for operations and channels for people. Built from settings; a
+    # destination without credentials is skipped and logged. The outbox lives in the control store.
+    ledger = ActionLedger(store=store)
+    dispatcher = ActionDispatcher(ledger, build_action_connectors(settings))
+    dashboard = DashboardConnector()
+    outbox = NotificationOutbox(store, build_notification_connectors(settings, dashboard=dashboard), max_attempts=settings.notify_max_attempts)
+    logger.info("connectors.wired", actions=[c["name"] for c in dispatcher.describe()], channels=outbox.channels)
+
     pipeline = PipelineOrchestrator(
         stream_source=stream,
         trigger_engine=trigger_engine,
@@ -108,13 +124,27 @@ async def lifespan(app: FastAPI):
         generator=generator,
         settings=settings,
         coordinator=coordinator,
+        outbox=outbox,
     )
 
     # Register WebSocket broadcast as pipeline callback
     pipeline.on_output(ws_manager.broadcast)
 
     # Wire up API routes
-    set_dependencies(pipeline, ws_manager, action_ledger=ActionLedger(store=store))
+    set_dependencies(pipeline, ws_manager, action_ledger=ledger, action_dispatcher=dispatcher, outbox=outbox, dashboard=dashboard)
+
+    async def drain_outbox_forever() -> None:
+        """Deliver queued notifications (retries included) and push dashboard messages to clients."""
+        while True:
+            await asyncio.sleep(settings.notify_drain_interval_seconds)
+            try:
+                await asyncio.to_thread(outbox.drain)
+                for message in dashboard.pop_pending():
+                    await ws_manager.broadcast({"type": "notification", "notification": message})
+            except Exception as e:  # the drain loop must survive a bad connector
+                logger.error("outbox.drain_error", error=str(e))
+
+    drain_task = asyncio.create_task(drain_outbox_forever(), name="stag-outbox")
 
     # Initialize and start
     await pipeline.initialize()
@@ -125,6 +155,11 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("stag.shutting_down")
+    drain_task.cancel()
+    try:
+        await drain_task
+    except (asyncio.CancelledError, Exception):
+        pass
     await pipeline.stop()
     close = getattr(store, "close", None)
     if close is not None:

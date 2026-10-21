@@ -12,6 +12,7 @@ import os
 import socket
 import time
 from collections import deque
+from typing import Any
 
 import structlog
 
@@ -45,6 +46,7 @@ class PipelineOrchestrator:
         generator: InsightGenerator,
         settings: Settings,
         coordinator: IncidentCoordinator | None = None,
+        outbox: Any = None,
     ) -> None:
         self.stream = stream_source
         self.triggers = trigger_engine
@@ -58,6 +60,11 @@ class PipelineOrchestrator:
         # durable control store can race on the same request; only the lease holder generates.
         self.worker_id = getattr(settings, "techops_worker_id", "") or f"{socket.gethostname()}:{os.getpid()}"
         self.investigation_lease_seconds = int(getattr(settings, "techops_investigation_lease_seconds", 300))
+        # Detector-driven paging: independent of retrieval and generation, one page per incident
+        # and severity, deduplicated by the outbox (never by this process's memory).
+        self.outbox = outbox
+        self.page_on_severity = (getattr(settings, "page_on_severity", "") or "").strip().lower()
+        self.pages_enqueued = 0
 
         self._running = False
         self._task: asyncio.Task | None = None
@@ -253,6 +260,10 @@ class PipelineOrchestrator:
             }
         )
 
+        # Step 3a (TechOps): page people on a material change, before any enrichment.
+        if decision is not None:
+            self._page(decision, trigger)
+
         # Step 3b: index the accepted observation (enrichment, bounded by a deadline)
         await self._index(event)
 
@@ -358,6 +369,42 @@ class PipelineOrchestrator:
         )
         await self._emit({"type": "insight", "output": output.model_dump(mode="json")})
 
+    _PAGE_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+    def _page(self, decision, trigger) -> None:
+        """Enqueue one notification per configured channel for a new incident or a severity
+        increase at or above ``page_on_severity``. The dedup key (incident, severity) makes a
+        repeated symptom or a redelivery a duplicate at the outbox."""
+        if self.outbox is None or not self.page_on_severity or self.coordinator is None:
+            return
+        change = getattr(decision.material_change, "value", decision.material_change)
+        if change not in ("new_incident", "severity_increase", "recurrence_after_resolved"):
+            return
+        try:
+            incident = self.coordinator.get_incident(decision.incident_id)
+        except KeyError:
+            return
+        severity = incident.severity.value
+        if self._PAGE_RANK.get(severity, 0) < self._PAGE_RANK.get(self.page_on_severity, 99):
+            return
+        from stag.connectors.notifications import Notification
+
+        display = str(incident.attributes.get("signal_display", incident.signal_key))
+        for channel in self.outbox.channels:
+            receipt = self.outbox.enqueue(
+                Notification(
+                    channel=channel,
+                    incident_id=incident.id,
+                    title=f"{severity.upper()} incident {incident.id}: {display}"[:500],
+                    body=f"{change.replace('_', ' ')} · rule {trigger.rule_name} · {trigger.reason}"[:4000],
+                    severity=severity,
+                    dedup_key=f"{incident.id}:{severity}",
+                    provenance={"actor": "stag-detector", "rule": trigger.rule_name, "material_change": change, "worker": self.worker_id},
+                )
+            )
+            if receipt.status == "queued":
+                self.pages_enqueued += 1
+
     @staticmethod
     def _build_retrieval_query(event: StreamEvent, trigger) -> str:
         """Build a search query from the event and trigger context.
@@ -416,6 +463,7 @@ class PipelineOrchestrator:
             "trigger_rate": self._trigger_count / max(1, self._event_count),
             "techops": self.coordinator.stats if self.coordinator else None,
             "stream": getattr(self.stream, "stats", None),
+            "pages_enqueued": self.pages_enqueued,
             "status": self.status,
             "last_error": self.last_error,
             "trigger_engine": self.triggers.stats,

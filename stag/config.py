@@ -65,6 +65,37 @@ class Settings(BaseSettings):
     techops_worker_id: str = ""
     techops_investigation_lease_seconds: int = 300
 
+    # Connectors (destinations for operations). Comma-separated: fake-ticketing, jira, servicenow.
+    # A connector whose credentials are missing is not built (logged at startup). Credentials come
+    # from the environment, never from the repository.
+    action_connectors: str = "fake-ticketing"
+    jira_base_url: str = ""
+    jira_email: str = ""
+    jira_api_token: str = ""
+    jira_project_key: str = ""
+    jira_issue_type: str = "Task"
+    servicenow_instance_url: str = ""
+    servicenow_user: str = ""
+    servicenow_password: str = ""
+    servicenow_table: str = "incident"
+
+    # Notification channels. Comma-separated: dashboard, pagerduty, slack, email, fake.
+    notify_channels: str = "dashboard"
+    # New incidents and severity increases at or above this severity page every configured channel
+    # (one page per incident and severity; "" disables detector-driven paging).
+    page_on_severity: str = "critical"
+    notify_drain_interval_seconds: float = 5.0
+    notify_max_attempts: int = 5
+    pagerduty_routing_key: str = ""
+    slack_webhook_url: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_starttls: bool = True
+    email_from: str = ""
+    email_to: str = ""  # comma-separated recipients
+
     # Simulator
     simulator_interval: float = 3.0
     simulator_scenario: str = "enterprise_ai"

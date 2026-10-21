@@ -349,6 +349,14 @@ class ActionLedger:
 
         return self._commit(operation_id, mutate)
 
+    def mark_failed(self, operation_id: str, actor: str = "executor", reason: str = "") -> ActionRecord:
+        """The destination definitively refused the operation (no effect happened). Terminal."""
+        def mutate(record: ActionRecord) -> None:
+            record._move(ActionState.FAILED, actor, reason or "destination rejected the operation")
+            record.verification["failure_reason"] = reason[:300]
+
+        return self._commit(operation_id, mutate)
+
     def mark_outcome_unknown(self, operation_id: str, actor: str = "executor", note: str = "") -> ActionRecord:
         """The response was lost or timed out. Not a failure, not a success: reconcile."""
         def mutate(record: ActionRecord) -> None:
