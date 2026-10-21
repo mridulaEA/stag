@@ -269,3 +269,32 @@ async def test_request_leased_elsewhere_suppresses_generation_on_this_worker():
     assert messages[-1]["type"] == "incident_update"
     assert "another worker" in messages[-1]["decision"]["reason"]
     assert orch.stats["investigations_suppressed"] == 1
+
+
+# --------------------------------------------------------------------------- detector-driven paging (connectors)
+
+
+async def test_orchestrator_pages_once_per_incident_and_severity():
+    from stag.connectors import FakeNotificationConnector, NotificationOutbox
+    from stag.models.schemas import Severity
+    from stag.techops.store import InMemoryControlStore
+
+    critical_event = _event
+    pager, slack = FakeNotificationConnector("pagerduty"), FakeNotificationConnector("slack")
+    outbox = NotificationOutbox(InMemoryControlStore(), [pager, slack])
+    orch = PipelineOrchestrator(stream_source=StubStream(), trigger_engine=TriggerEngine(), retriever=StubRetriever(), generator=StubGenerator(),
+                                settings=Settings(page_on_severity="critical", _env_file=None), coordinator=IncidentCoordinator(investigation_cooldown_seconds=3600), outbox=outbox)
+    first = critical_event()
+    await orch.inject_event(first)
+    await orch.inject_event(first)              # redelivery
+    await orch.inject_event(critical_event())   # repeated symptom
+    assert orch.stats["pages_enqueued"] == 2  # one per channel
+    receipts = outbox.drain()
+    assert sorted(r.channel for r in receipts) == ["pagerduty", "slack"] and all(r.status == "delivered" for r in receipts)
+    assert len(pager.delivered) == 1 and pager.delivered[0].severity == "critical" and pager.delivered[0].provenance["actor"] == "stag-detector"
+    assert outbox.drain() == []
+    # below the threshold: nothing is paged
+    quiet = PipelineOrchestrator(stream_source=StubStream(), trigger_engine=TriggerEngine(), retriever=StubRetriever(), generator=StubGenerator(),
+                                 settings=Settings(page_on_severity="critical", _env_file=None), coordinator=IncidentCoordinator(), outbox=NotificationOutbox(InMemoryControlStore(), [FakeNotificationConnector("pagerduty")]))
+    await quiet.inject_event(critical_event(severity=Severity.HIGH))
+    assert quiet.stats["pages_enqueued"] == 0
